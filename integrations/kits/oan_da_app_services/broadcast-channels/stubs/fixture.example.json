@@ -1,0 +1,24 @@
+{
+  "farmers": [
+    {"farmer_id": "FR-EXAMPLE-1", "first_name": "Abebe", "language_spoken": "am", "record_status": "ACTIVE",
+     "phones": [{"number": "+251900000811", "is_primary": true}], "primary_phone": "+251900000811",
+     "region_code": "ET04", "zone_code": "ET0408", "woreda_code": "ET040801", "kebele_code": "ET04080101",
+     "telegram": true},
+    {"farmer_id": "FR-EXAMPLE-2", "first_name": "Chaltu", "language_spoken": "om", "record_status": "ACTIVE",
+     "phones": [{"number": "+251900000812", "is_primary": true}], "primary_phone": "+251900000812",
+     "region_code": "ET04", "zone_code": "ET0408", "woreda_code": "ET040801", "kebele_code": "ET04080102",
+     "telegram": true, "telegram_fails": true},
+    {"farmer_id": "FR-EXAMPLE-3", "first_name": "Dawit", "language_spoken": "am", "record_status": "ACTIVE",
+     "phones": [{"number": "+251900000813", "is_primary": true}], "primary_phone": "+251900000813",
+     "region_code": "ET04", "zone_code": "ET0408", "woreda_code": "ET040801", "kebele_code": "ET04080101"},
+    {"farmer_id": "FR-EXAMPLE-4", "first_name": "Hirut", "language_spoken": "am", "record_status": "ACTIVE",
+     "phones": [], "primary_phone": null,
+     "region_code": "ET04", "zone_code": "ET0408", "woreda_code": "ET040801", "kebele_code": "ET04080101"}
+  ],
+  "agents": [
+    {"da_id": "DA-EXAMPLE-1", "region_code": "ET04", "zone_code": "ET0408", "woreda_code": "ET040801",
+     "kebele_code": "ET04080101", "telegram": true},
+    {"da_id": "DA-EXAMPLE-2", "region_code": "ET04", "zone_code": "ET0408", "woreda_code": "ET040801",
+     "kebele_code": "ET04080102", "telegram": false}
+  ]
+}

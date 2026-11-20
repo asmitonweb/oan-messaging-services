@@ -1,0 +1,21 @@
+{
+  "description": "GET status: provider outcome unknown. OAN will not resend; callers must not resubmit or use a new key.",
+  "schema": "MessageStatusView",
+  "body": {
+    "id": "0b9f3a52-5c1e-4d55-9b7a-3f1c2a7e9d10",
+    "idempotency_key": "6f1d2c3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f",
+    "channel": "sms",
+    "purpose": "otp",
+    "source_reference": "esignet:otp:tx-7f3c9a",
+    "status": "unknown",
+    "final": false,
+    "failure_code": "timeout",
+    "provider_status": "timeout",
+    "recipient_masked": "+2519******01",
+    "delivery_receipts_supported": true,
+    "attempts": 1,
+    "created_at": "2026-09-01T05:12:13Z",
+    "updated_at": "2026-09-01T05:12:29Z",
+    "expires_at": "2026-09-01T05:17:13Z"
+  }
+}

@@ -1,0 +1,32 @@
+%% Target: RapidPro routes Telegram; SMS stays separate (modules -> OAN Messaging -> registered phone)
+flowchart TB
+  F(["Farmer (Telegram)"]) <--> TG["Telegram Bot API"]
+  DA(["Development Agent<br/>(Telegram, same bot)"]) <--> TG
+  CH["Telegram channels<br/>(broadcasts, no code)"] -.-> F
+  TG -- "webhook (Design 1)" --> GW["APISIX: one path only<br/>secret header + Telegram IPs"]
+  subgraph RP["RapidPro (private namespace)"]
+    CR["courier: Telegram channel"]
+    MR["mailroom flows: language, location, menus,<br/>prices, ask a DA, link my Farmer ID"]
+  end
+  GW --> CR
+  CR <--> MR
+  CR -- "replies (reply keyboards)" --> TG
+  subgraph BS["OAN Bot Services (new, small API)"]
+    AD["Adapters:<br/>Master Data, Marketplace"]
+    HO["Handover: DA routing,<br/>question store, relay"]
+    LK["Farmer linking"]
+  end
+  MR -- "flow webhooks" --> AD
+  MR -- "flow webhooks" --> HO
+  MR -- "flow webhooks" --> LK
+  HO --> DAB["DA backend roster"]
+  LK -- "registered phone" --> BEN["Beneficiary API"]
+  LK -- "issue / verify OTP" --> AUTH["Auth service"]
+  subgraph SMSP["SMS: separate from the bot, outbound only"]
+    MOD["Modules: Credit, DPI, Grievance, DA, Auth<br/>(phone from the beneficiary API)"]
+    OAN["OAN Messaging"]
+    P(["Farmer's registered phone (8028)"])
+  end
+  AUTH -- "linking OTP = an Auth SMS" --> MOD
+  MOD -- "POST /messages/sms" --> OAN
+  OAN --> P

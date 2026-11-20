@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.env
+secrets/
+*.key
+*.pem
+dist/
+
+# Local integration trial: generated secrets, certificates and checkouts
+trial/stack/.env
+trial/stack/*/.env
+trial/stack/trial-ca.crt
+trial/repos/*/

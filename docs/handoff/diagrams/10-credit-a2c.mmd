@@ -1,0 +1,12 @@
+%% Credit (A2C): where farmer SMS are raised
+flowchart TB
+  subgraph A2C["oan_a2c (thin patch)"]
+    U["update_loan_status()<br/>bank changes stage"] --> M["event_for_transition()<br/>stage_changed / application_approved /<br/>application_rejected / loan_disbursed"]
+    S["submit_application()"] --> E1["application_submitted"]
+    V["A2C Visit Schedule<br/>insert / cancelled"] --> E2["visit_scheduled / visit_cancelled<br/>expires at visit (max 7 days)"]
+    M --> R["render(event, language)<br/>one SMS part"]
+    E1 --> R
+    E2 --> R
+  end
+  R -- "queue_sms(purpose = transactional,<br/>source_reference = a2c:APP-...:event)" --> C[["oan_messaging_connector"]]
+  C --> OAN["OAN Messaging"] --> P(["Farmer phone"])

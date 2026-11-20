@@ -1,0 +1,22 @@
+{
+  "description": "GET status: 8028 Delivered receipt (SMS only).",
+  "schema": "MessageStatusView",
+  "body": {
+    "id": "0b9f3a52-5c1e-4d55-9b7a-3f1c2a7e9d10",
+    "idempotency_key": "6f1d2c3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f",
+    "channel": "sms",
+    "purpose": "otp",
+    "source_reference": "esignet:otp:tx-7f3c9a",
+    "status": "delivered",
+    "final": true,
+    "provider_status": "Delivered",
+    "recipient_masked": "+2519******01",
+    "delivery_receipts_supported": true,
+    "attempts": 1,
+    "created_at": "2026-09-01T05:12:13Z",
+    "updated_at": "2026-09-01T05:12:19Z",
+    "expires_at": "2026-09-01T05:17:13Z",
+    "sent_at": "2026-09-01T05:12:14Z",
+    "delivered_at": "2026-09-01T05:12:19Z"
+  }
+}

@@ -1,0 +1,12 @@
+%% Telegram through OAN (no caller in Phase 1)
+sequenceDiagram
+  autonumber
+  participant T as Future Telegram caller (none in Phase 1)
+  participant OAN as OAN API
+  participant B as Telegram Bot API
+  actor F as Farmer (has started the bot)
+  T->>OAN: POST /messages/telegram (chat_id, text, purpose)<br/>caller is mapped to ONE bot by the OAN operator
+  OAN->>B: sendMessage via that bot
+  B->>F: message
+  T->>OAN: GET /messages/{id}
+  OAN-->>T: sent = final (Telegram never reports delivered)

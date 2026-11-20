@@ -1,0 +1,15 @@
+{
+  "description": "409: same key, different body. Never retried automatically.",
+  "schema": "Problem",
+  "body": {
+    "title": "Idempotency conflict",
+    "status": 409,
+    "code": "idempotency_conflict",
+    "errors": [
+      {
+        "field": "header.Idempotency-Key",
+        "code": "payload_mismatch"
+      }
+    ]
+  }
+}

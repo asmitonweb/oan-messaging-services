@@ -1,0 +1,146 @@
+openapi: 3.1.0
+info:
+  title: Farmer registry beneficiary API (service clients)
+  version: 0.1.0-proposed
+  description: |
+    The routes the DA backend (broadcasts) and Bot Services (Telegram Farmer ID linking)
+    need from the farmer registry. Proposed by the OAN messaging team; the registry owner
+    builds them (Channels Specification §8.4, ID-01 and ID-04). See
+    BENEFICIARY-API-REQUIREMENTS.md for the reasons and the data rules.
+
+    Service-to-service only: a Keycloak client-credentials token from the staff realm,
+    with the permission `farmer:contact:read`. No farmer consent per call (the access rule
+    is the registry owner's to issue; see the requirements document).
+
+    Area codes are Master Data `level_value_id`s (for example ET04 region, ET0408 zone,
+    ET040801 woreda, ET04080101 kebele): the codes the DA backend keys its DA Region /
+    DA Zone / DA Woreda / DA Kebele on, never names.
+servers:
+  - url: https://farmer-registry.example.invalid
+security:
+  - clientCredentials: [farmer:contact:read]
+paths:
+  /api/v1/farmers:
+    get:
+      operationId: listFarmersByArea
+      summary: Registered farmers of one area, with their phones, page by page
+      parameters:
+        - name: level
+          in: query
+          required: true
+          schema: {type: string, enum: [region, zone, woreda, kebele]}
+        - name: code
+          in: query
+          required: true
+          description: Master Data level_value_id of the area at that level.
+          schema: {type: string, pattern: '^[A-Za-z0-9_-]{2,32}$'}
+        - name: record_status
+          in: query
+          schema: {type: string, enum: [ACTIVE, INACTIVE, ARCHIVED], default: ACTIVE}
+        - name: updated_since
+          in: query
+          description: Only farmers whose record (phones included) was last approved at or after this time.
+          schema: {type: string, format: date-time}
+        - name: page_size
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 500}
+        - name: cursor
+          in: query
+          description: Opaque; from the previous page's next_cursor. Stable while paging, even if records change.
+          schema: {type: string}
+      responses:
+        '200':
+          description: One page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Farmer'}
+                  next_cursor:
+                    type: [string, 'null']
+                    description: null on the last page.
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+  /api/v1/farmers/{farmer_id}:
+    get:
+      operationId: getFarmer
+      summary: One farmer by Farmer ID (Telegram linking, ID-01)
+      parameters:
+        - name: farmer_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The farmer
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Farmer'}
+        '401': {$ref: '#/components/responses/Problem'}
+        '403': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+components:
+  securitySchemes:
+    clientCredentials:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://keycloak.example.invalid/realms/staff/protocol/openid-connect/token
+          scopes:
+            farmer:contact:read: Read farmers' names, phones, language and area codes
+  schemas:
+    Farmer:
+      type: object
+      required: [farmer_id, phones, region_code, zone_code, woreda_code, kebele_code, record_status]
+      properties:
+        farmer_id: {type: string, description: 'The Farmer ID shown to the farmer (functional_record_id, e.g. FR-...)'}
+        first_name: {type: string}
+        middle_name: {type: string, description: "Father's name"}
+        last_name: {type: string, description: "Grandfather's name"}
+        language_spoken: {type: [string, 'null'], description: 'Code from the language code list, e.g. am, om, ti, en'}
+        primary_phone:
+          type: [string, 'null']
+          description: The phone marked primary, normalised to E.164 (+2519..., +2517...); null when none.
+        phones:
+          type: array
+          items:
+            type: object
+            required: [number, is_primary]
+            properties:
+              number: {type: string, description: E.164}
+              is_primary: {type: boolean}
+        region_code: {type: string}
+        zone_code: {type: string}
+        woreda_code: {type: string}
+        kebele_code: {type: string, description: 'Master Data kebele id (geo_lowest_level_value_id)'}
+        region_name: {type: string}
+        zone_name: {type: string}
+        woreda_name: {type: string}
+        kebele_name: {type: string}
+        record_status: {type: string, enum: [ACTIVE, INACTIVE, ARCHIVED]}
+        approved_at: {type: string, format: date-time, description: Last approval of the record}
+  responses:
+    Problem:
+      description: RFC 9457 problem; `code` is value-free and never echoes submitted data
+      content:
+        application/problem+json:
+          schema:
+            type: object
+            required: [status, code]
+            properties:
+              type: {type: string}
+              title: {type: string}
+              status: {type: integer}
+              code: {type: string, examples: [validation_failed, unauthenticated, forbidden, not_found]}
+              errors:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    field: {type: string}
+                    code: {type: string}

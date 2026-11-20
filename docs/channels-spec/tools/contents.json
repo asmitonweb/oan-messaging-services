@@ -1,0 +1,42 @@
+[
+ [
+  "0 About this document",
+  "3"
+ ],
+ [
+  "1 Purpose, scope and principles",
+  "4"
+ ],
+ [
+  "2 Architecture",
+  "6"
+ ],
+ [
+  "3 SMS channel: the OAN Messaging Service",
+  "10"
+ ],
+ [
+  "4 SMS channel: callers and the Frappe connector",
+  "14"
+ ],
+ [
+  "5 Telegram channel: platform, security and shared rules",
+  "19"
+ ],
+ [
+  "6 Telegram channel: modules",
+  "26"
+ ],
+ [
+  "7 Deployment, operations and testing",
+  "41"
+ ],
+ [
+  "8 Build order and decisions",
+  "44"
+ ],
+ [
+  "Appendix A: v1.0 custom router (fallback)",
+  "52"
+ ]
+]

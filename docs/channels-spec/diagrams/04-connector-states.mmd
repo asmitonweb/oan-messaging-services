@@ -1,0 +1,13 @@
+%% OAN Message row (connector outbox) as shown in the Desk
+stateDiagram-v2
+  direction LR
+  [*] --> Queued: queue_sms()
+  Queued --> Queued: uncertain outcome<br/>retry, same key
+  Queued --> Submitted: OAN accepted (202/200)
+  Queued --> Failed: rejected / conflict /<br/>expired before submission
+  Submitted --> Submitted: poll: accepted / sending / sent
+  Submitted --> Done: poll: delivered / failed<br/>(Telegram: sent)
+  Submitted --> Attention: poll: unknown or<br/>receipt window ended
+  Failed --> Attention
+  state "Polling complete" as Done
+  state "Needs Attention (operator)" as Attention

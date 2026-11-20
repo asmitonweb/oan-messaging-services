@@ -1,0 +1,585 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OAN Messaging <messaging@example.invalid>
+Date: Tue, 17 Nov 2026 00:15:45 +0530
+Subject: [PATCH] feat(sms): farmer SMS for the loan lifecycle through
+ oan_messaging_connector
+
+Queues one SMS per farmer event with oan_messaging_connector.queue_sms, inside the
+business transaction (sent after commit; never blocks a loan action):
+
+- application_submitted from submit_application;
+- stage_changed, application_approved, application_rejected, loan_disbursed (only for
+  a Disbursed stage) and application_completed from update_loan_status;
+- visit_scheduled and visit_cancelled from A2C Visit Schedule doc_events, expiring
+  when the visit starts.
+
+Texts fit one SMS part at the longest field values and carry no amounts or staff
+free text. A stage move on an already closed application sends only a late "paid out"; visit hooks never block the visit action. Adds oan_messaging_connector to required_apps and fetches it in CI (repository variable OAN_MESSAGING_CONNECTOR_REPO).
+---
+ .github/workflows/ci.yml              |   4 +
+ oan_a2c/api/v1/farmer/applications.py |   4 +
+ oan_a2c/api/v1/loan_applications.py   |   7 +
+ oan_a2c/hooks.py                      |   7 +-
+ oan_a2c/oan_messaging/__init__.py     |   0
+ oan_a2c/oan_messaging/events.py       | 120 +++++++++++++++++
+ oan_a2c/oan_messaging/notify.py       | 151 +++++++++++++++++++++
+ oan_a2c/tests/test_farmer_sms.py      | 181 ++++++++++++++++++++++++++
+ 8 files changed, 473 insertions(+), 1 deletion(-)
+ create mode 100644 oan_a2c/oan_messaging/__init__.py
+ create mode 100644 oan_a2c/oan_messaging/events.py
+ create mode 100644 oan_a2c/oan_messaging/notify.py
+ create mode 100644 oan_a2c/tests/test_farmer_sms.py
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 8134a04..88ec2e2 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -89,6 +89,9 @@ jobs:
+         working-directory: /home/runner/frappe-bench
+         run: |
+           bench get-app https://github.com/Centre-for-Open-Societal-Systems/oan_auth_service
++          # oan_messaging_connector is a required app (farmer SMS); set the repository
++          # variable OAN_MESSAGING_CONNECTOR_REPO until it is published under this org.
++          bench get-app oan_messaging_connector "${OAN_MESSAGING_CONNECTOR_REPO:-https://github.com/Centre-for-Open-Societal-Systems/oan_messaging_connector.git}" --branch develop
+           bench get-app oan_a2c $GITHUB_WORKSPACE
+           bench setup requirements --dev
+           bench new-site --db-root-password root --admin-password admin test_site
+@@ -96,6 +99,7 @@ jobs:
+           bench build
+         env:
+           CI: 'Yes'
++          OAN_MESSAGING_CONNECTOR_REPO: ${{ vars.OAN_MESSAGING_CONNECTOR_REPO }}
+ 
+       - name: Run Tests
+         working-directory: /home/runner/frappe-bench
+diff --git a/oan_a2c/api/v1/farmer/applications.py b/oan_a2c/api/v1/farmer/applications.py
+index fda6973..f294045 100644
+--- a/oan_a2c/api/v1/farmer/applications.py
++++ b/oan_a2c/api/v1/farmer/applications.py
+@@ -308,6 +308,10 @@ def submit_application(**kwargs):
+ 	submitted_at = now_datetime()
+ 	doc.db_set("submitted_at", submitted_at)
+ 
++	from oan_a2c.oan_messaging.notify import notify_application
++
++	notify_application(doc, "application_submitted")
++
+ 	return success_response(
+ 		data={"submitted_at": to_tz_aware_iso(submitted_at)},
+ 		message="Application submitted successfully",
+diff --git a/oan_a2c/api/v1/loan_applications.py b/oan_a2c/api/v1/loan_applications.py
+index f1f4045..e3e3a4a 100644
+--- a/oan_a2c/api/v1/loan_applications.py
++++ b/oan_a2c/api/v1/loan_applications.py
+@@ -1191,6 +1191,13 @@ def update_loan_status(**kwargs):
+ 	# very roles it targets and leaving no audit record.
+ 	audit_event.insert(ignore_permissions=True)
+ 
++	# Farmer SMS (queued in this transaction, sent only after it commits). A status or
++	# stage that did not change sends nothing.
++	if status_changed or stage_changed:
++		from oan_a2c.oan_messaging.notify import notify_status_change
++
++		notify_status_change(doc, target_archetype, resolved["stage_label"], status_changed=status_changed)
++
+ 	return success_response(message=_("Loan status updated to {0}.").format(resolved["stage_label"]))
+ 
+ 
+diff --git a/oan_a2c/hooks.py b/oan_a2c/hooks.py
+index 4a2c044..3fb9940 100644
+--- a/oan_a2c/hooks.py
++++ b/oan_a2c/hooks.py
+@@ -9,7 +9,7 @@
+ # Apps
+ # ------------------
+ 
+-required_apps = ["oan_auth_service"]
++required_apps = ["oan_auth_service", "oan_messaging_connector"]
+ 
+ # Each item in the list will be shown as an app in the apps page
+ # add_to_apps_screen = [
+@@ -193,6 +193,11 @@
+ 		"on_update": "oan_a2c.a2c_marketplace.stats_cache.on_application_change",
+ 		"on_trash": "oan_a2c.a2c_marketplace.stats_cache.on_application_change",
+ 	},
++	# Farmer SMS through oan_messaging_connector (oan_a2c/oan_messaging/notify.py).
++	"A2C Visit Schedule": {
++		"after_insert": "oan_a2c.oan_messaging.notify.on_visit_insert",
++		"on_update": "oan_a2c.oan_messaging.notify.on_visit_update",
++	},
+ 	"A2C Credit Information": {
+ 		"after_insert": "oan_a2c.openagrinet_access_to_credit.doctype.a2c_credit_information.a2c_credit_information.sync_lead_loan_amount",
+ 		"on_update": "oan_a2c.openagrinet_access_to_credit.doctype.a2c_credit_information.a2c_credit_information.sync_lead_loan_amount",
+diff --git a/oan_a2c/oan_messaging/__init__.py b/oan_a2c/oan_messaging/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/oan_a2c/oan_messaging/events.py b/oan_a2c/oan_messaging/events.py
+new file mode 100644
+index 0000000..900481a
+--- /dev/null
++++ b/oan_a2c/oan_messaging/events.py
+@@ -0,0 +1,120 @@
++"""Credit (A2C) farmer SMS: events and texts.
++
++A2C owns which events reach the farmer and what they say. Sending (outbox, keys,
++dispatch, status) belongs to ``oan_messaging_connector``; see ``notify.py``.
++
++======================  ===================================================================
++Event                   Raised by
++======================  ===================================================================
++application_submitted   ``api/v1/farmer/applications.py`` ``submit_application``
++stage_changed           ``api/v1/loan_applications.py`` ``update_loan_status`` (In Transition)
++application_approved    same, when the bank's stage label is "Approved" (bank-defined)
++application_rejected    same, Reject transition (status Rejected)
++loan_disbursed          same, Complete transition **only** when the stage label is "Disbursed"
++application_completed   same, Complete transition with any other stage label: a neutral
++                        notice, because a bank may complete before paying out
++visit_scheduled         A2C Visit Schedule inserted with status Scheduled
++visit_cancelled         A2C Visit Schedule status changed to Cancelled
++======================  ===================================================================
++
++Rules for every text:
++
++* One SMS part (160 GSM-7 characters, or 70 with any Amharic character), checked by
++  ``render`` at the longest field values A2C may substitute (``FIELD_LIMITS``).
++* No amounts, rejection reasons or other free text typed by bank staff.
++* English source texts; translations are added per language under the same key and
++  must pass the same length check.
++
++The consent OTP and consent notices belong to the DPI Consent Manager, not to A2C.
++"""
++
++from __future__ import annotations
++
++from datetime import datetime, timedelta
++
++from oan_messaging_connector.sms import fits_one_sms
++
++#: Source texts. Placeholders: bank, app, stage, visit, date, time, place.
++TEMPLATES: dict[str, dict[str, str]] = {
++	"application_submitted": {
++		"en": "OAN Credit: your loan application {app} was sent to {bank}. We will tell "
++		"you when it moves forward.",
++	},
++	"stage_changed": {
++		"en": "OAN Credit: your loan application {app} with {bank} is now at stage: {stage}.",
++	},
++	"application_approved": {
++		"en": "OAN Credit: {bank} approved your loan application {app}. The bank will "
++		"contact you about next steps.",
++	},
++	"application_rejected": {
++		"en": "OAN Credit: {bank} did not approve loan application {app}. Ask your agent "
++		"or the bank for the reason.",
++	},
++	"loan_disbursed": {
++		"en": "OAN Credit: {bank} has paid out the loan for application {app}. Contact the "
++		"bank if you have not received it.",
++	},
++	"application_completed": {
++		"en": "OAN Credit: {bank} has completed your loan application {app}. The bank will "
++		"contact you about the loan.",
++	},
++	"visit_scheduled": {
++		"en": "OAN Credit: an agent will visit you on {date} at {time}, at {place}. Visit ref {visit}.",
++	},
++	"visit_cancelled": {
++		"en": "OAN Credit: agent visit {visit} on {date} is cancelled. Your agent will "
++		"contact you to book a new time.",
++	},
++}
++
++A2C_EVENTS = tuple(TEMPLATES)
++
++#: Longest values A2C may substitute; the tests render every template at these lengths.
++FIELD_LIMITS = {"bank": 30, "app": 14, "stage": 30, "visit": 15, "date": 11, "time": 5, "place": 40}
++
++#: OAN accepts an expiry at most 7 days ahead; stay a little inside it.
++MAX_EXPIRY_HORIZON = timedelta(days=7)
++EXPIRY_SAFETY_MARGIN = timedelta(minutes=5)
++
++
++class TemplateTooLong(ValueError):
++	"""The rendered text does not fit one SMS part. Shorten the template or the value."""
++
++
++def render(event: str, language: str = "en", **fields: str) -> str:
++	"""Render ``event`` in ``language``, falling back to English when no translation exists."""
++	if event not in TEMPLATES:
++		raise ValueError(f"unknown A2C event {event!r}")
++	for name, value in fields.items():
++		if name in FIELD_LIMITS and len(value) > FIELD_LIMITS[name]:
++			raise TemplateTooLong(f"{name} longer than {FIELD_LIMITS[name]} characters")
++	template = TEMPLATES[event].get(language) or TEMPLATES[event]["en"]
++	text = template.format(**fields)
++	if not fits_one_sms(text):
++		raise TemplateTooLong(f"{event}/{language} does not fit one SMS part")
++	return text
++
++
++def event_for_transition(new_status: str, stage_label: str | None) -> str | None:
++	"""Map an application status or stage change to a farmer event (``None``: no SMS).
++
++	``new_status`` is the application ``status`` after the transition; ``stage_label`` is
++	the bank-defined stage. Banks name their own stages, so "Approved" and "Disbursed"
++	are matched by label, and each bank confirms its labels.
++	"""
++	label = (stage_label or "").strip().lower()
++	if new_status == "Rejected":
++		return "application_rejected"
++	if new_status == "Completed":
++		return "loan_disbursed" if label == "disbursed" else "application_completed"
++	if new_status == "In Transition" and label:
++		return "application_approved" if label == "approved" else "stage_changed"
++	return None
++
++
++def visit_deadline(visit_starts_at: datetime, now: datetime) -> datetime | None:
++	"""A visit message is useless after the visit starts. Capped inside OAN's expiry
++	horizon; ``None`` when the visit has already started."""
++	deadline = min(visit_starts_at, now + MAX_EXPIRY_HORIZON - EXPIRY_SAFETY_MARGIN)
++	return deadline if deadline > now else None
+diff --git a/oan_a2c/oan_messaging/notify.py b/oan_a2c/oan_messaging/notify.py
+new file mode 100644
+index 0000000..d0fd752
+--- /dev/null
++++ b/oan_a2c/oan_messaging/notify.py
+@@ -0,0 +1,151 @@
++"""Credit (A2C) farmer SMS: raise events through ``oan_messaging_connector.queue_sms``.
++
++Application events are raised from the API functions that change the application
++(``submit_application``, ``update_loan_status``), not from ``on_update``: A2C mirrors
++``status`` with ``db_set``, which skips ``on_update``. Visit events use the
++A2C Visit Schedule ``doc_events`` in ``hooks.py``, because inserting a schedule or
++cancelling it is itself the business event.
++
++``queue_sms`` only inserts an outbox row in the current transaction; the connector sends
++it after commit. It never raises, so an SMS problem never blocks a loan action.
++"""
++
++from __future__ import annotations
++
++from datetime import UTC, datetime
++from typing import Any
++from zoneinfo import ZoneInfo
++
++import frappe
++from frappe.utils import get_system_timezone, get_time, getdate
++from oan_messaging_connector.api import queue_sms
++
++from .events import TemplateTooLong, event_for_transition, render, visit_deadline
++
++#: Display language (as stored on A2C records) to message language code.
++LANGUAGES = {
++	"english": "en",
++	"en": "en",
++	"amharic": "am",
++	"am": "am",
++	"afaan oromo": "om",
++	"oromo": "om",
++	"om": "om",
++	"tigrinya": "ti",
++	"ti": "ti",
++}
++DEFAULT_VISIT_TIME = "09:00:00"
++CLOSED_STATUSES = ("Completed", "Rejected")
++
++
++def _lang(value: str | None) -> str:
++	return LANGUAGES.get((value or "").strip().lower(), "en")
++
++
++def _bank_short(bank: str | None) -> str:
++	name = (frappe.db.get_value("A2C Participating Bank", bank, "bank_name") if bank else "") or ""
++	name = name.strip() or "your bank"
++	return name if len(name) <= 30 else name[:29].rstrip() + "."
++
++
++def _lead_phone(lead: str | None) -> str | None:
++	return frappe.db.get_value("A2C Lead", lead, "phone_number") if lead else None
++
++
++def _queue(
++	event: str,
++	doc: Any,
++	phone: str | None,
++	lang: str,
++	fields: dict[str, str],
++	expires_at: datetime | None = None,
++) -> str | None:
++	try:
++		text = render(event, lang, **fields)
++	except (TemplateTooLong, KeyError, ValueError) as exc:
++		frappe.log_error(f"A2C SMS not queued for {doc.name}/{event}: {exc}", "OAN Messaging")
++		return None
++	return queue_sms(
++		recipient=phone,
++		text=text,
++		purpose="transactional",
++		source_reference=f"a2c:{doc.name}:{event}",
++		reference_doctype=doc.doctype,
++		reference_name=doc.name,
++		event=event,
++		language=lang,
++		expires_at=expires_at,
++	)
++
++
++def notify_application(doc: Any, event: str | None) -> str | None:
++	"""Queue ``event`` about a loan application; returns the OAN Message name or None."""
++	if not event:
++		return None
++	fields = {
++		"bank": _bank_short(doc.get("bank")),
++		"app": doc.name,
++		"stage": (doc.get("stage_label") or "")[:30],
++	}
++	return _queue(event, doc, doc.get("phone_number"), _lang(doc.get("language")), fields)
++
++
++def notify_status_change(
++	doc: Any, new_status: str, stage_label: str | None, status_changed: bool = True
++) -> str | None:
++	"""Queue the farmer event for a status or stage change, if it has one.
++
++	A stage move on an application that is already closed (Completed or Rejected) is not
++	news to the farmer, except a bank recording the payout afterwards.
++	"""
++	event = event_for_transition(new_status, stage_label)
++	if new_status in CLOSED_STATUSES and not status_changed and event != "loan_disbursed":
++		return None
++	return notify_application(doc, event)
++
++
++def _visit_start(schedule: Any) -> datetime | None:
++	if not schedule.get("visit_date"):
++		return None
++	# Time fields arrive as timedelta (loaded) or as strings such as "9:00" (from the API).
++	local = datetime.combine(
++		getdate(schedule.visit_date), get_time(schedule.get("visit_time") or DEFAULT_VISIT_TIME)
++	)
++	return local.replace(tzinfo=ZoneInfo(get_system_timezone())).astimezone(UTC)
++
++
++def notify_visit(schedule: Any, event: str) -> str | None:
++	"""Queue a visit event; it expires when the visit starts. None for a past visit."""
++	start = _visit_start(schedule)
++	if start is None:
++		return None
++	deadline = visit_deadline(start, datetime.now(UTC))
++	if deadline is None:
++		return None
++	local = start.astimezone(ZoneInfo(get_system_timezone()))
++	place = (schedule.get("meeting_location") or schedule.get("kebele") or "the agreed place").strip()
++	fields = {
++		"visit": schedule.name,
++		"date": f"{local.day} {local:%b %Y}",
++		"time": f"{local:%H:%M}",
++		"place": place[:40],
++	}
++	return _queue(event, schedule, _lead_phone(schedule.get("lead")), "en", fields, expires_at=deadline)
++
++
++def _never_block(event: str, doc: Any) -> None:
++	"""A visit hook must never fail the visit action because of an SMS."""
++	try:
++		notify_visit(doc, event)
++	except Exception as exc:
++		frappe.log_error(f"A2C SMS not queued for {doc.name}/{event}: {type(exc).__name__}", "OAN Messaging")
++
++
++def on_visit_insert(doc: Any, method: str | None = None) -> None:
++	if (doc.get("status") or "Scheduled") == "Scheduled":
++		_never_block("visit_scheduled", doc)
++
++
++def on_visit_update(doc: Any, method: str | None = None) -> None:
++	if doc.has_value_changed("status") and doc.get("status") == "Cancelled":
++		_never_block("visit_cancelled", doc)
+diff --git a/oan_a2c/tests/test_farmer_sms.py b/oan_a2c/tests/test_farmer_sms.py
+new file mode 100644
+index 0000000..4d596d9
+--- /dev/null
++++ b/oan_a2c/tests/test_farmer_sms.py
+@@ -0,0 +1,181 @@
++"""Credit (A2C) farmer SMS queued through oan_messaging_connector.
++
++Nothing is dispatched here: the connector's own tests cover dispatch and polling. Each
++test runs in a transaction that IntegrationTestCase rolls back.
++"""
++
++from datetime import UTC, datetime, timedelta
++from unittest import mock
++
++import frappe
++from frappe.tests import IntegrationTestCase
++
++from oan_a2c.oan_messaging import events, notify
++
++PHONE = "0900000711"
++APP = "APP-2026-91001"
++
++
++def app_doc(**kw):
++	base = {
++		"doctype": "A2C Loan Application",
++		"name": APP,
++		"phone_number": PHONE,
++		"language": "English",
++		"bank": None,
++		"stage_label": "Verified",
++	}
++	base.update(kw)
++	return frappe._dict(base)
++
++
++class VisitDoc(frappe._dict):
++	"""A2C Visit Schedule stand-in with the one Document method the hooks use."""
++
++	def has_value_changed(self, fieldname):
++		return fieldname in self.get("changed", ())
++
++
++def visit_doc(starts_in=timedelta(days=2), **kw):
++	start = (datetime.now() + starts_in).replace(microsecond=0)
++	base = {
++		"doctype": "A2C Visit Schedule",
++		"name": "VSCH-2026-91001",
++		"lead": "LEAD-TEST",
++		"visit_date": start.date().isoformat(),
++		"visit_time": start.time().isoformat(),
++		"meeting_location": "Kebele 01 office",
++		"status": "Scheduled",
++	}
++	base.update(kw)
++	return VisitDoc(base)
++
++
++class TestFarmerSms(IntegrationTestCase):
++	def setUp(self):
++		frappe.set_user("Administrator")
++		keys = ("oan_messaging_enabled", "oan_messaging_base_url", "oan_messaging_token")
++		self._conf = {k: frappe.conf.get(k) for k in keys}
++		frappe.conf.oan_messaging_enabled = 1
++		frappe.conf.oan_messaging_base_url = "https://oan-messaging.example.invalid"
++		frappe.conf.oan_messaging_token = "oanmsg_" + "t" * 43
++		self.addCleanup(self._restore_conf)
++		phone = mock.patch.object(notify, "_lead_phone", return_value=PHONE)
++		phone.start()
++		self.addCleanup(phone.stop)
++
++	def _restore_conf(self):
++		for k, v in self._conf.items():
++			frappe.conf[k] = v
++
++	def msg(self, name):
++		self.assertIsNotNone(name)
++		return frappe.get_doc("OAN Message", name)
++
++	def test_status_changes_queue_the_matching_farmer_event(self):
++		cases = {
++			("Rejected", "Rejected"): "application_rejected",
++			("Completed", "Disbursed"): "loan_disbursed",
++			("Completed", "Loan Closed"): "application_completed",
++			("In Transition", "Approved"): "application_approved",
++			("In Transition", "Verified"): "stage_changed",
++		}
++		for (status, stage), event in cases.items():
++			m = self.msg(notify.notify_status_change(app_doc(), status, stage))
++			self.assertEqual((m.event, m.purpose, m.recipient), (event, "transactional", PHONE))
++			self.assertEqual(m.source_reference, f"a2c:{APP}:{event}")
++			self.assertEqual((m.reference_doctype, m.reference_name), ("A2C Loan Application", APP))
++			self.assertIn(APP, m.text)
++		self.assertIsNone(notify.notify_status_change(app_doc(), "Active", None))
++
++	def test_stage_moves_on_a_closed_application_send_only_paid_out(self):
++		for status, stage in (("Completed", "Loan Closed"), ("Rejected", "Appeal Noted")):
++			self.assertIsNone(notify.notify_status_change(app_doc(), status, stage, status_changed=False))
++		m = self.msg(notify.notify_status_change(app_doc(), "Completed", "Disbursed", status_changed=False))
++		self.assertEqual(m.event, "loan_disbursed")
++
++	def test_paid_out_only_for_a_disbursed_stage(self):
++		self.assertEqual(events.event_for_transition("Completed", " disbursed "), "loan_disbursed")
++		for label in (None, "", "Approved", "Sanctioned", "Loan Closed"):
++			self.assertEqual(events.event_for_transition("Completed", label), "application_completed", label)
++
++	def test_submitted_event_without_a_bank_names_your_bank(self):
++		m = self.msg(notify.notify_application(app_doc(), "application_submitted"))
++		self.assertIn("sent to your bank", m.text)
++		self.assertIsNone(m.expires_at)
++
++	def test_untranslated_language_falls_back_to_english(self):
++		m = self.msg(notify.notify_application(app_doc(language="Amharic"), "stage_changed"))
++		self.assertEqual(m.language, "am")
++		self.assertTrue(m.text.startswith("OAN Credit:"))
++
++	def test_no_phone_no_message(self):
++		self.assertIsNone(notify.notify_application(app_doc(phone_number=None), "stage_changed"))
++
++	def test_long_bank_name_is_shortened_not_refused(self):
++		real = frappe.db.get_value
++
++		def bank_name(doctype, *args, **kwargs):
++			if doctype == "A2C Participating Bank":
++				return "B" * 60
++			return real(doctype, *args, **kwargs)
++
++		with mock.patch.object(frappe.db, "get_value", side_effect=bank_name):
++			m = self.msg(notify.notify_application(app_doc(bank="BANK-1"), "application_submitted"))
++		self.assertIn("B" * 29 + ".", m.text)
++
++	def test_visit_scheduled_expires_at_the_visit(self):
++		doc = visit_doc()
++		notify.on_visit_insert(doc)
++		name = frappe.db.get_value("OAN Message", {"reference_name": doc.name, "event": "visit_scheduled"})
++		m = self.msg(name)
++		self.assertEqual((m.recipient, m.source_reference), (PHONE, f"a2c:{doc.name}:visit_scheduled"))
++		self.assertIn("Kebele 01 office", m.text)
++		self.assertIsNotNone(m.expires_at)
++
++	def test_visit_cancelled_only_on_the_change_to_cancelled(self):
++		notify.on_visit_update(visit_doc(status="Cancelled"))  # status did not change
++		notify.on_visit_update(visit_doc(status="Completed", changed=("status",)))
++		self.assertFalse(
++			frappe.db.exists("OAN Message", {"reference_name": "VSCH-2026-91001", "event": "visit_cancelled"})
++		)
++		notify.on_visit_update(visit_doc(status="Cancelled", changed=("status",)))
++		self.assertTrue(
++			frappe.db.exists("OAN Message", {"reference_name": "VSCH-2026-91001", "event": "visit_cancelled"})
++		)
++
++	def test_visit_time_as_stored_or_typed(self):
++		"""A loaded Time field is a timedelta ("9:00:00"); the API may send "9:00"."""
++		day = (datetime.now() + timedelta(days=2)).date().isoformat()
++		for value in (timedelta(hours=9), "9:00", "09:00:00", None):
++			self.assertIsNotNone(
++				notify.notify_visit(visit_doc(visit_date=day, visit_time=value), "visit_scheduled"), value
++			)
++
++	def test_visit_hooks_never_raise(self):
++		with mock.patch.object(notify, "notify_visit", side_effect=ValueError("bad time")):
++			notify.on_visit_insert(visit_doc())
++			notify.on_visit_update(visit_doc(status="Cancelled", changed=("status",)))
++
++	def test_past_visit_sends_nothing(self):
++		self.assertIsNone(notify.notify_visit(visit_doc(starts_in=-timedelta(days=1)), "visit_scheduled"))
++
++	def test_visit_deadline_is_capped_inside_the_expiry_horizon(self):
++		now = datetime.now(UTC)
++		self.assertEqual(events.visit_deadline(now + timedelta(days=2), now), now + timedelta(days=2))
++		self.assertEqual(
++			events.visit_deadline(now + timedelta(days=30), now),
++			now + events.MAX_EXPIRY_HORIZON - events.EXPIRY_SAFETY_MARGIN,
++		)
++		self.assertIsNone(events.visit_deadline(now - timedelta(hours=1), now))
++
++	def test_every_template_fits_one_sms_at_maximum_field_lengths(self):
++		fields = {k: "W" * n for k, n in events.FIELD_LIMITS.items()}
++		for event in events.A2C_EVENTS:
++			for language in events.TEMPLATES[event]:
++				events.render(event, language, **fields)  # raises TemplateTooLong if not
++
++	def test_hooks_wire_the_visit_events(self):
++		hooks = frappe.get_hooks("doc_events").get("A2C Visit Schedule", {})
++		self.assertIn("oan_a2c.oan_messaging.notify.on_visit_insert", hooks.get("after_insert", []))
++		self.assertIn("oan_a2c.oan_messaging.notify.on_visit_update", hooks.get("on_update", []))

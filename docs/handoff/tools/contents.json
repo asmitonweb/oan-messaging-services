@@ -1,0 +1,62 @@
+[
+ [
+  "00 Overview and module index",
+  "3"
+ ],
+ [
+  "01 Architecture",
+  "7"
+ ],
+ [
+  "02 Common rules (every caller)",
+  "10"
+ ],
+ [
+  "03 The Frappe connector (oan_messaging_connector)",
+  "13"
+ ],
+ [
+  "04 OTP senders (Auth, eSignet, DPI Consent Manager)",
+  "18"
+ ],
+ [
+  "10 Credit (A2C): farmer SMS for the loan lifecycle",
+  "20"
+ ],
+ [
+  "11 DPI Consent Manager: consent OTPs by SMS",
+  "23"
+ ],
+ [
+  "12 Grievance: farmer notices",
+  "27"
+ ],
+ [
+  "13 DA Services: visit planned and rescheduled",
+  "31"
+ ],
+ [
+  "14 Auth: password-reset OTP",
+  "34"
+ ],
+ [
+  "15 eSignet: login OTP for Farmer ID",
+  "37"
+ ],
+ [
+  "16 Telegram",
+  "39"
+ ],
+ [
+  "20 Testing and acceptance",
+  "41"
+ ],
+ [
+  "21 Environments and onboarding",
+  "43"
+ ],
+ [
+  "22 Decisions and open items",
+  "45"
+ ]
+]

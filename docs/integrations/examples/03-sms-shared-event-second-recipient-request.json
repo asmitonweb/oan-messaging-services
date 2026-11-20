@@ -1,0 +1,20 @@
+{
+  "description": "Same DA event, second recipient: same source_reference, different Idempotency-Key.",
+  "request": {
+    "method": "POST",
+    "path": "/api/v1/messages/sms"
+  },
+  "headers": {
+    "Content-Type": "application/json",
+    "Idempotency-Key": "8a7b6c5d-4e3f-4a1b-9c8d-7e6f5a4b3c2d"
+  },
+  "schema": "SmsSubmission",
+  "expect_status": 202,
+  "body": {
+    "recipient": "0700000005",
+    "text": "Visit V-77 with farmer, 3 Sep 09:00.",
+    "source_reference": "da:visit:V-77:ve-1",
+    "purpose": "transactional",
+    "expires_at": "2026-09-03T05:12:13Z"
+  }
+}

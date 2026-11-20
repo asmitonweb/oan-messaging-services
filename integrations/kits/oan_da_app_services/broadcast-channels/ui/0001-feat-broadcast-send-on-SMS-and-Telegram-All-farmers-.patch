@@ -1,0 +1,448 @@
+From cb54b9fa171af2e719cc284d5a785bd96ecb0520 Mon Sep 17 00:00:00 2001
+From: dineshriyer <249892547+dineshriyer@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:13:15 +0530
+Subject: [PATCH] feat(broadcast): send on SMS and Telegram; All farmers for
+ the Communications Officer
+
+The Broadcast screen showed SMS and Telegram as disabled boxes and offered
+All farmers to every role, although in-app reaches agents only and the FSD
+gives farmer broadcasts to the Communications Officer.
+
+- SMS and Telegram boxes are live. In-app only to agents still goes to
+  POST /notifications/broadcast, unchanged; any SMS or Telegram goes to
+  POST /broadcasts (da_broadcast_channels): Telegram first, then the SMS
+  copy to everyone not reached on Telegram.
+- All farmers is offered to the Communications Officer and the Admin only,
+  for a whole Region, Zone or Woreda.
+- SMS part count follows OAN Messaging (70 characters per part with any
+  Amharic letter, 153/67 per part beyond one, at most three). A warning
+  shows when the SMS turns multi-part; Send is disabled beyond three.
+  The preview and the Knowledge Base send dialog use the same count.
+---
+ .../components/BroadcastWorkspace.tsx         | 112 ++++++++++++------
+ .../components/SendToFarmersModal.tsx         |   3 +-
+ .../communication/components/SmsPreview.tsx   |   5 +-
+ src/features/communication/index.ts           |   1 +
+ src/features/communication/smsParts.test.ts   |  32 +++++
+ src/features/communication/smsParts.ts        |  29 +++++
+ src/features/notifications/api.test.ts        |  13 +-
+ src/features/notifications/api.ts             |  58 +++++++++
+ 8 files changed, 217 insertions(+), 36 deletions(-)
+ create mode 100644 src/features/communication/smsParts.test.ts
+ create mode 100644 src/features/communication/smsParts.ts
+
+diff --git a/src/app/(dashboard)/broadcast/components/BroadcastWorkspace.tsx b/src/app/(dashboard)/broadcast/components/BroadcastWorkspace.tsx
+index 79e4ff8..1f7d288 100644
+--- a/src/app/(dashboard)/broadcast/components/BroadcastWorkspace.tsx
++++ b/src/app/(dashboard)/broadcast/components/BroadcastWorkspace.tsx
+@@ -10,21 +10,21 @@ import { Textarea } from "@/components/ui/Textarea";
+ import { Select } from "@/components/ui/Select";
+ import { Checkbox } from "@/components/ui/Checkbox";
+ import { SmsPreview } from "@/features/communication";
+-import { RECIPIENT_GROUPS, SIGNALS, type RecipientGroup, type SignalSource } from "@/features/communication";
++import { RECIPIENT_GROUPS, SIGNALS, SMS_MAX_PARTS, smsParts, type RecipientGroup, type SignalSource } from "@/features/communication";
+ import { loadScopeAreas, useGeoCascade, type GeoField, type GeoLevel } from "@/features/assignments";
+-import { broadcastToKebele, broadcastToWoreda } from "@/features/notifications";
++import { broadcastToKebele, broadcastToWoreda, sendChannelBroadcast, type BroadcastChannel, type BroadcastLevel } from "@/features/notifications";
+ import { useAuthStore } from "@/store/useAuthStore";
+ import { FileDropInput } from "@/components/ui/FileDropInput";
+ import { ReceivedBroadcasts } from "./ReceivedBroadcasts";
+ 
+ const SOURCES: SignalSource[] = ["Knowledge", "Emergency", "Weather", "Informational"];
+ 
+-function GeoSelect({ field, label, level, hint, onSelect, onRetry }: { field: GeoField; label: string; level: GeoLevel; hint?: string; onSelect: (code: string) => void; onRetry: () => void }) {
++function GeoSelect({ field, label, level, hint, required = true, onSelect, onRetry }: { field: GeoField; label: string; level: GeoLevel; hint?: string; required?: boolean; onSelect: (code: string) => void; onRetry: () => void }) {
+   const id = `bc-${field}`;
+   const failed = level.status === "error";
+   const placeholder = level.status === "loading" ? "Loading…" : failed ? "Could not load" : `Select ${label}`;
+   return (
+-    <FormField label={label} htmlFor={id} required hint={level.error ?? hint} hintTone={failed ? "error" : "muted"}>
++    <FormField label={label} htmlFor={id} required={required} hint={level.error ?? hint} hintTone={failed ? "error" : "muted"}>
+       <Select id={id} value={level.selected?.code ?? ""} disabled={level.status !== "ready"} onChange={(e) => onSelect(e.target.value)}>
+         <option value="">{placeholder}</option>
+         {level.options.map((o) => <option key={o.code} value={o.code}>{o.name}</option>)}
+@@ -35,11 +35,15 @@ function GeoSelect({ field, label, level, hint, onSelect, onRetry }: { field: Ge
+ }
+ 
+ // FR-10 / §4.4: Communications Officer crafts a message, picks audience + channels, dispatches.
+-// In-app (POST /notifications/broadcast → the DAs' bell) is the only live channel; SMS/Telegram are
+-// shown but disabled until a gateway is wired.
++// In-app only to DAs goes to POST /notifications/broadcast (the DAs' bell), as before. Any SMS or Telegram goes to
++// POST /broadcasts (da_broadcast_channels add-on): Telegram first, then the SMS copy to everyone not reached on Telegram.
++// All farmers: Communications Officer / Admin only, a whole Region, Zone or Woreda (FSD).
+ export function BroadcastWorkspace() {
+   const role = useAuthStore((s) => s.role);
+   const canDispatch = role === "CommsOfficer" || role === "Admin" || role === "DA" || role === "Supervisor";
++  // Broadcasts to farmers belong to the Communications Officer (FSD); the Admin can do everything.
++  const canReachFarmers = role === "CommsOfficer" || role === "Admin";
++  const groups = canReachFarmers ? RECIPIENT_GROUPS : RECIPIENT_GROUPS.filter((g) => g !== "Farmers");
+   // A DA broadcasts to their own Kebele only: the Kebeles they are posted to, from /me.
+   const ownKebeleOnly = role === "DA";
+   const ownKebeles = useAuthStore((s) => (s.role === "DA" ? s.profile?.kebeles : undefined));
+@@ -70,8 +74,10 @@ export function BroadcastWorkspace() {
+   }, [ownWoreda]);
+   // In-app, the only live channel, reaches Development Agents only, so that is the default for everyone until SMS / Telegram reach farmers.
+   const [group, setGroup] = useState<RecipientGroup>("Development Agents");
+-  // In-app = the real notification-bell broadcast. Checked by default; SMS/Telegram are disabled stubs.
++  // In-app = the notification-bell broadcast (DAs only). SMS and Telegram reach farmers and DAs.
+   const [inApp, setInApp] = useState(true);
++  const [sms, setSms] = useState(false);
++  const [telegram, setTelegram] = useState(false);
+   const [notice, setNotice] = useState<string | null>(null);
+   const [error, setError] = useState<string | null>(null);
+   const [sending, setSending] = useState(false);
+@@ -80,28 +86,62 @@ export function BroadcastWorkspace() {
+   const toDAs = group === "Development Agents";
+   // A Supervisor's Woreda is fixed: their own code is what goes out. Everyone else (but a DA) picks Region, Zone, Woreda.
+   const woreda = ownWoredaOnly ? (ownWoreda ? { code: ownWoreda, name: ownWoredaName ?? ownWoreda } : null) : geo.woreda.selected;
+-  const area = ownKebeleOnly ? (kebele ? `${kebele.name} Kebele` : null) : woreda ? `${woreda.name} Woreda` : null;
++  // All farmers may be a whole Region or Zone: the deepest level chosen is the area.
++  const wide = !toDAs && !ownKebeleOnly && !ownWoredaOnly;
++  const wideLevel: BroadcastLevel | null = geo.woreda.selected ? "woreda" : geo.zone.selected ? "zone" : geo.region.selected ? "region" : null;
++  const wideArea = wideLevel ? geo[wideLevel as "region" | "zone" | "woreda"].selected : null;
++  const levelLabel = (l: BroadcastLevel) => l.charAt(0).toUpperCase() + l.slice(1);
++  const area = ownKebeleOnly
++    ? (kebele ? `${kebele.name} Kebele` : null)
++    : wide
++      ? (wideArea && wideLevel ? `${wideArea.name} ${levelLabel(wideLevel)}` : null)
++      : woreda ? `${woreda.name} Woreda` : null;
++  const channels: BroadcastChannel[] = [...(toDAs && inApp ? (["in_app"] as const) : []), ...(sms ? (["sms"] as const) : []), ...(telegram ? (["telegram"] as const) : [])];
++  // The SMS copy is the message as written (else the title); OAN takes up to three parts.
++  const parts = smsParts(message.trim() || title.trim());
++  const smsTooLong = sms && parts > SMS_MAX_PARTS;
+   const areaLabel = area ?? (ownKebeleOnly ? "your Kebele" : "the selected Woreda");
+ 
+   const dispatch = async () => {
+     setError(null);
+     setNotice(null);
+-    // In-app bell reaches Development Agents only.
+-    if (!toDAs) {
+-      setError("In-app delivery reaches Development Agents only. Choose “All Development Agents”, or wait for SMS / Telegram.");
++    if (!channels.length) {
++      setError(toDAs ? "Choose at least one channel." : "Choose SMS or Telegram: in-app delivery reaches Development Agents only.");
+       return;
+     }
+-    const target = ownKebeleOnly ? kebele : woreda;
+-    if (!target || !area) return;
++    if (!area) return;
+     setSending(true);
+     try {
+-      const input = { title: title.trim(), body: message.trim(), href: "/notifications", source };
+-      const res = ownKebeleOnly ? await broadcastToKebele({ ...input, kebeleCode: target.code }) : await broadcastToWoreda({ ...input, woredaCode: target.code });
+-      setNotice(
+-        res.duplicate
+-          ? `Already sent to ${area} — no duplicate created.`
+-          : `Broadcast delivered to ${res.recipients} Development Agent${res.recipients === 1 ? "" : "s"} in ${area} — it is now in their notification bell.`,
+-      );
++      const input = { title: title.trim(), body: message.trim(), source };
++      if (channels.length === 1 && channels[0] === "in_app") {
++        // Unchanged: the in-app broadcast to DAs.
++        const target = ownKebeleOnly ? kebele : woreda;
++        if (!target) return;
++        const res = ownKebeleOnly ? await broadcastToKebele({ ...input, href: "/notifications", kebeleCode: target.code }) : await broadcastToWoreda({ ...input, href: "/notifications", woredaCode: target.code });
++        setNotice(
++          res.duplicate
++            ? `Already sent to ${area} — no duplicate created.`
++            : `Broadcast delivered to ${res.recipients} Development Agent${res.recipients === 1 ? "" : "s"} in ${area} — it is now in their notification bell.`,
++        );
++      } else {
++        const [scope, scopeValue]: [BroadcastLevel, string | undefined] = ownKebeleOnly
++          ? ["kebele", kebele?.code]
++          : wide
++            ? [wideLevel ?? "woreda", wideArea?.code]
++            : ["woreda", woreda?.code];
++        if (!scopeValue) return;
++        const res = await sendChannelBroadcast({ ...input, recipients: toDAs ? "das" : "farmers", scope, scopeValue, channels });
++        const how = [
++          res.inApp ? `in the bell of ${res.inApp.recipients} Development Agent${res.inApp.recipients === 1 ? "" : "s"}` : null,
++          telegram ? "on Telegram first" : null,
++          sms ? `by SMS (${parts} part${parts > 1 ? "s" : ""} each)${telegram ? " to those not reached on Telegram" : ""}` : null,
++        ].filter(Boolean).join(", then ");
++        setNotice(
++          res.duplicate
++            ? `Already sent to ${area} — no duplicate created.`
++            : `Broadcast to ${toDAs ? "Development Agents" : "farmers"} in ${area} is on its way: ${how}.`,
++        );
++      }
+       setTitle(""); setMessage(""); setEvidence([]);
+     } catch (err) {
+       // ApiError.message already carries the backend's reason (e.g. "Woreda X is not in your scope", or no DA is posted there).
+@@ -111,7 +151,7 @@ export function BroadcastWorkspace() {
+     }
+   };
+ 
+-  const canSend = canDispatch && Boolean(area) && !sending && inApp && title.trim().length >= 3 && message.trim().length >= 5;
++  const canSend = canDispatch && Boolean(area) && !sending && channels.length > 0 && !smsTooLong && title.trim().length >= 3 && message.trim().length >= 5;
+ 
+   return (
+     <>
+@@ -145,33 +185,39 @@ export function BroadcastWorkspace() {
+               ) : (
+                 <>
+                   <GeoSelect field="region" label="Region" level={geo.region} onSelect={(code) => select("region", code)} onRetry={() => retry("region")} />
+-                  <GeoSelect field="zone" label="Zone" level={geo.zone} onSelect={(code) => select("zone", code)} onRetry={() => retry("zone")} />
+-                  <GeoSelect field="woreda" label="Woreda" level={geo.woreda} hint="Broadcasts reach a whole Woreda." onSelect={(code) => select("woreda", code)} onRetry={() => retry("woreda")} />
++                  <GeoSelect field="zone" label="Zone" level={geo.zone} required={!wide} onSelect={(code) => select("zone", code)} onRetry={() => retry("zone")} />
++                  <GeoSelect field="woreda" label="Woreda" level={geo.woreda} required={!wide} hint={wide ? "Leave Woreda (or Zone) empty to reach every farmer of the Zone (or Region)." : "Broadcasts reach a whole Woreda."} onSelect={(code) => select("woreda", code)} onRetry={() => retry("woreda")} />
+                 </>
+               )}
+-              <FormField label="Recipients" htmlFor="bc-group" required hint={`${toDAs ? "Development Agents" : "Farmers"} in ${areaLabel}${toDAs ? "" : ". In-app delivery reaches Development Agents only."}`}>
+-                <Select id="bc-group" value={group} onChange={(e) => setGroup(e.target.value as RecipientGroup)}>{RECIPIENT_GROUPS.map((g) => <option key={g} value={g}>{g === "Farmers" ? "All farmers" : "All Development Agents"}</option>)}</Select>
++              <FormField label="Recipients" htmlFor="bc-group" required hint={`${toDAs ? "Development Agents" : "Farmers"} in ${areaLabel}${toDAs ? "" : ". Farmers receive SMS and Telegram; in-app reaches Development Agents only."}`}>
++                <Select id="bc-group" value={group} onChange={(e) => setGroup(e.target.value as RecipientGroup)}>{groups.map((g) => <option key={g} value={g}>{g === "Farmers" ? "All farmers" : "All Development Agents"}</option>)}</Select>
+               </FormField>
+             </div>
+             <FormField label="Title" htmlFor="bc-title" required hint="Shown as the notification heading (3 to 140 characters)." hintTone={title.trim().length > 0 && title.trim().length < 3 ? "error" : "muted"}>
+               <Input id="bc-title" value={title} maxLength={140} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Fertiliser distribution starts Monday" />
+             </FormField>
+-            <FormField label="Message" htmlFor="bc-message" required hint={`At least 5 characters · ${message.length} characters · ${Math.max(1, Math.ceil(message.length / 160))} SMS segment${message.length > 160 ? "s" : ""} · Amharic + English supported`} hintTone={message.trim().length > 0 && message.trim().length < 5 ? "error" : "muted"}>
++            <FormField label="Message" htmlFor="bc-message" required hint={smsTooLong ? `Too long for SMS: ${parts} parts, at most ${SMS_MAX_PARTS}. Shorten the message or untick SMS.` : `At least 5 characters · ${message.length} characters · ${parts} SMS part${parts > 1 ? "s" : ""} · Amharic + English supported`} hintTone={smsTooLong || (message.trim().length > 0 && message.trim().length < 5) ? "error" : "muted"}>
+               <Textarea id="bc-message" rows={5} value={message} onChange={(e) => setMessage(e.target.value)} placeholder="Write the message farmers or DAs will receive…" />
+             </FormField>
++            {sms && parts > 1 && !smsTooLong && (
++              <Banner tone="warning" title={`The SMS will go out as ${parts} parts`}>
++                Each recipient gets one message joined from {parts} SMS parts, and every part is charged. {/[^\x00-\x7F]/.test(message) ? "Amharic letters fit 67 per part (70 in a single SMS)." : "English fits 153 characters per part (160 in a single SMS)."}
++              </Banner>
++            )}
+             <fieldset>
+               <legend className="text-[14px] font-medium text-ink">Channels<span className="ml-1 text-danger">*</span></legend>
+               <div className="mt-2 flex flex-wrap gap-5">
++                <label className={`flex items-center gap-2 text-[13.5px] ${toDAs ? "cursor-pointer text-slate-700" : "cursor-not-allowed text-slate-400"}`} title={toDAs ? undefined : "In-app reaches Development Agents only"}>
++                  <Checkbox checked={toDAs && inApp} disabled={!toDAs} onChange={() => setInApp((v) => !v)} /> In-app
++                </label>
++                <label className="flex cursor-pointer items-center gap-2 text-[13.5px] text-slate-700">
++                  <Checkbox checked={sms} onChange={() => setSms((v) => !v)} /> SMS
++                </label>
+                 <label className="flex cursor-pointer items-center gap-2 text-[13.5px] text-slate-700">
+-                  <Checkbox checked={inApp} onChange={() => setInApp((v) => !v)} /> In-app
++                  <Checkbox checked={telegram} onChange={() => setTelegram((v) => !v)} /> Telegram
+                 </label>
+-                {(["SMS", "Telegram"] as const).map((c) => (
+-                  <label key={c} className="flex cursor-not-allowed items-center gap-2 text-[13.5px] text-slate-400" title="Not wired yet">
+-                    <Checkbox checked={false} disabled onChange={() => {}} /> {c}
+-                  </label>
+-                ))}
+               </div>
+-              <p className="mt-1.5 text-[12px] text-muted">In-app delivers to the Development Agents&apos; notification bell (live). SMS / Telegram are not wired yet.</p>
++              <p className="mt-1.5 text-[12px] text-muted">In-app goes to the Development Agents&apos; notification bell. Telegram reaches those linked in the bot; with both ticked, Telegram goes first and the SMS copy reaches everyone not reached on Telegram.</p>
+             </fieldset>
+             <FileDropInput label="Evidence" actionLabel="Upload evidence" hint="Field photos or documents · PDF, JPG or PNG up to 5 MB each" files={evidence} onChange={setEvidence} />
+             {canDispatch && !canSend && !sending && <p className="text-right text-[12.5px] text-muted">Complete every field marked * to enable Send.</p>}
+diff --git a/src/features/communication/components/SendToFarmersModal.tsx b/src/features/communication/components/SendToFarmersModal.tsx
+index 6e362f7..32e0f24 100644
+--- a/src/features/communication/components/SendToFarmersModal.tsx
++++ b/src/features/communication/components/SendToFarmersModal.tsx
+@@ -10,6 +10,7 @@ import { Select } from "@/components/ui/Select";
+ import { Checkbox } from "@/components/ui/Checkbox";
+ import { SmsPreview } from "./SmsPreview";
+ import { BROADCAST_WOREDAS, audienceOf, audienceSize, type Article, type Channel } from "../data";
++import { smsParts } from "../smsParts";
+ 
+ // FR-11 "Send to farmers": snippet composer → channels (SMS/Telegram) → dispatch via the Broadcast engine, logged.
+ // Like every broadcast, the audience is all farmers of one Woreda.
+@@ -51,7 +52,7 @@ export function SendToFarmersModal({ article, isOpen, onClose }: { article: Arti
+       ) : (
+         <div className="grid grid-cols-1 gap-5 md:grid-cols-[1fr_260px]">
+           <div className="flex flex-col gap-4">
+-            <FormField label="Message" htmlFor="snippet" required hint={`${text.length} characters · ${Math.max(1, Math.ceil(text.length / 160))} SMS segment${text.length > 160 ? "s" : ""}`}>
++            <FormField label="Message" htmlFor="snippet" required hint={`${text.length} characters · ${smsParts(text)} SMS segment${smsParts(text) > 1 ? "s" : ""}`}>
+               <Textarea id="snippet" rows={5} value={text} onChange={(e) => setText(e.target.value)} />
+             </FormField>
+             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+diff --git a/src/features/communication/components/SmsPreview.tsx b/src/features/communication/components/SmsPreview.tsx
+index fabe391..8777ad0 100644
+--- a/src/features/communication/components/SmsPreview.tsx
++++ b/src/features/communication/components/SmsPreview.tsx
+@@ -1,6 +1,9 @@
+ // Live SMS preview — a feature-phone frame so officers see what a farmer receives (FR-10).
++import { smsParts } from "../smsParts";
++
+ export function SmsPreview({ text, sender }: { text: string; sender: string }) {
+-  const segments = Math.max(1, Math.ceil(text.length / 160));
++  // Counted as OAN counts it: 70 characters per SMS once the text has any Amharic letter.
++  const segments = smsParts(text);
+   return (
+     <div className="flex flex-col items-center">
+       <div className="w-full max-w-[260px] rounded-[22px] border-[6px] border-ink bg-slate-900 p-3 shadow-lg">
+diff --git a/src/features/communication/index.ts b/src/features/communication/index.ts
+index a941e93..36b6504 100644
+--- a/src/features/communication/index.ts
++++ b/src/features/communication/index.ts
+@@ -2,6 +2,7 @@
+ export * from "./data";
+ export * from "./knowledgeApi";
+ export * from "./sanitizeHtml";
++export * from "./smsParts";
+ export * from "./advisors";
+ export * from "./advisorsApi";
+ export * from "./components/SendToFarmersModal";
+diff --git a/src/features/communication/smsParts.test.ts b/src/features/communication/smsParts.test.ts
+new file mode 100644
+index 0000000..7b966e5
+--- /dev/null
++++ b/src/features/communication/smsParts.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, it } from "vitest";
++import { SMS_MAX_PARTS, smsParts } from "./smsParts";
++
++// The same boundaries the OAN Messaging service enforces (oan_messaging.contracts.sms_parts).
++describe("smsParts", () => {
++  it.each([
++    ["", 1],
++    ["a".repeat(160), 1],
++    ["a".repeat(161), 2],
++    ["a".repeat(306), 2],
++    ["a".repeat(307), 3],
++    ["a".repeat(459), 3],
++    ["a".repeat(460), 4],
++    ["ቅ".repeat(70), 1],
++    ["ቅ".repeat(71), 2],
++    ["ቅ".repeat(201), 3],
++    ["ቅ".repeat(202), 4],
++    ["a".repeat(69) + "ቅ", 1],
++    ["a".repeat(70) + "ቅ", 2],
++    ["{".repeat(228) + "a", 3],
++    ["{".repeat(228) + "aa", 4],
++    ["😀".repeat(35), 1],
++    ["😀".repeat(99), 3],
++    ["😀".repeat(100), 4],
++  ])("%#: counts parts", (text, parts) => {
++    expect(smsParts(text)).toBe(parts);
++  });
++
++  it("caps a message at three parts", () => {
++    expect(SMS_MAX_PARTS).toBe(3);
++  });
++});
+diff --git a/src/features/communication/smsParts.ts b/src/features/communication/smsParts.ts
+new file mode 100644
+index 0000000..3b6bb56
+--- /dev/null
++++ b/src/features/communication/smsParts.ts
+@@ -0,0 +1,29 @@
++// How many SMS parts a text takes, counted exactly as OAN Messaging counts it (contract 3.1.0, SMS-09).
++// One part holds 160 GSM-7 characters, or 70 when any character is outside GSM-7 (any Amharic letter or emoji).
++// A longer text is sent as concatenated parts of 153 / 67, and a two-unit character is never split between parts.
++
++const GSM7_BASIC = new Set(
++  "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà",
++);
++const GSM7_EXTENSION = new Set("^{}\\[~]|€\f");
++
++/** OAN refuses an SMS longer than this many parts. */
++export const SMS_MAX_PARTS = 3;
++
++export function smsParts(text: string): number {
++  const chars = Array.from(text);
++  const gsm = chars.every((c) => GSM7_BASIC.has(c) || GSM7_EXTENSION.has(c));
++  const sizes = gsm ? chars.map((c) => (GSM7_EXTENSION.has(c) ? 2 : 1)) : chars.map((c) => c.length);
++  const [single, perPart] = gsm ? [160, 153] : [70, 67];
++  if (sizes.reduce((a, b) => a + b, 0) <= single) return 1;
++  let parts = 1;
++  let room = perPart;
++  for (const size of sizes) {
++    if (size > room) {
++      parts += 1;
++      room = perPart;
++    }
++    room -= size;
++  }
++  return parts;
++}
+diff --git a/src/features/notifications/api.test.ts b/src/features/notifications/api.test.ts
+index 679644c..2314edf 100644
+--- a/src/features/notifications/api.test.ts
++++ b/src/features/notifications/api.test.ts
+@@ -1,6 +1,6 @@
+ import { beforeEach, describe, expect, it, vi } from "vitest";
+ import { useAuthStore } from "@/store/useAuthStore";
+-import { broadcastToKebele, broadcastToWoreda, listNotifications, markAllNotificationsRead, markNotificationRead } from "./api";
++import { broadcastToKebele, broadcastToWoreda, listNotifications, markAllNotificationsRead, markNotificationRead, sendChannelBroadcast } from "./api";
+ 
+ // Minimal in-memory Storage so the persisted auth store runs under Node.
+ class MemoryStorage implements Storage {
+@@ -73,4 +73,15 @@ describe("notifications api", () => {
+     expect(JSON.parse(String(init?.body))).toMatchObject({ scope: "kebele", scope_value: "ET04-W01-K03", client_op_id: "op-2" });
+     expect(result).toEqual({ broadcastId: "B-2", duplicate: false, recipients: 2, scopeValue: "ET04-W01-K03" });
+   });
++
++  it("sends a farmer broadcast on SMS and Telegram to the channels route", async () => {
++    fetchMock.mockResolvedValueOnce(json(200, { data: { broadcast_id: "op-3", duplicate: false, state: "Queued", sms: { parts: 2, queued: 0, read: 0 }, telegram: { recipients: 0 } } }));
++
++    const result = await sendChannelBroadcast({ recipients: "farmers", scope: "zone", scopeValue: "ET0408", channels: ["sms", "telegram"], title: "Title", body: "Message", source: "Weather", clientOpId: "op-3" });
++
++    const [url, init] = fetchMock.mock.calls[0];
++    expect(url).toBe("/api/v1/da-services/broadcasts");
++    expect(JSON.parse(String(init?.body))).toEqual({ recipients: "farmers", scope: "zone", scope_value: "ET0408", channels: ["sms", "telegram"], title: "Title", body: "Message", source: "Weather", client_op_id: "op-3" });
++    expect(result).toEqual({ broadcastId: "op-3", duplicate: false, state: "Queued", inApp: undefined, sms: { parts: 2, queued: 0, read: 0 }, telegram: { recipients: 0 } });
++  });
+ });
+diff --git a/src/features/notifications/api.ts b/src/features/notifications/api.ts
+index b7e4401..e80090a 100644
+--- a/src/features/notifications/api.ts
++++ b/src/features/notifications/api.ts
+@@ -114,3 +114,61 @@ export function broadcastToWoreda(input: BroadcastInput & { woredaCode: string }
+ export function broadcastToKebele(input: BroadcastInput & { kebeleCode: string }): Promise<BroadcastResult> {
+   return sendBroadcast(input, "kebele", input.kebeleCode);
+ }
++
++export type BroadcastChannel = "in_app" | "sms" | "telegram";
++export type BroadcastLevel = "region" | "zone" | "woreda" | "kebele";
++
++export interface ChannelBroadcastInput {
++  /** "farmers": Communications Officer / Admin only, a whole Region, Zone or Woreda. "das": as the in-app broadcast. */
++  recipients: "farmers" | "das";
++  scope: BroadcastLevel;
++  /** Master Data code of the area, never its name. */
++  scopeValue: string;
++  channels: BroadcastChannel[];
++  title: string;
++  body?: string;
++  source?: string;
++  clientOpId?: string;
++}
++
++export interface ChannelBroadcastResult {
++  broadcastId: string;
++  duplicate: boolean;
++  state: string;
++  inApp?: { recipients: number };
++  sms?: { parts: number; queued: number; read: number };
++  telegram?: { recipients: number; sent?: number };
++}
++
++/**
++ * POST /da-services/broadcasts — the broadcast with its SMS and Telegram copies (da_broadcast_channels add-on).
++ * The send continues in the background: Telegram first, then the SMS copy to everyone not reached on Telegram.
++ * The same clientOpId returns the first result (duplicate=true); a different message under it is a 409.
++ */
++export async function sendChannelBroadcast(input: ChannelBroadcastInput): Promise<ChannelBroadcastResult> {
++  interface Resp {
++    data: {
++      broadcast_id: string;
++      duplicate: boolean;
++      state: string;
++      in_app?: { recipients: number };
++      sms?: { parts: number; queued: number; read: number };
++      telegram?: { recipients: number; sent?: number };
++    };
++  }
++  const res = await authRequest<Resp>("/da-services/broadcasts", {
++    method: "POST",
++    body: {
++      recipients: input.recipients,
++      scope: input.scope,
++      scope_value: input.scopeValue,
++      channels: input.channels,
++      title: input.title,
++      body: input.body ?? "",
++      source: input.source,
++      client_op_id: input.clientOpId ?? crypto.randomUUID(),
++    },
++  });
++  const d = res.data;
++  return { broadcastId: d.broadcast_id, duplicate: d.duplicate, state: d.state, inApp: d.in_app, sms: d.sms, telegram: d.telegram };
++}
+-- 
+2.54.0 (Apple Git-157)
+

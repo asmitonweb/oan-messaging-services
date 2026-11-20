@@ -1,0 +1,4 @@
+FROM consent-manager:trial
+# Trial-only: the upstream image (framework v1.1.5) lacks greenlet, required by
+# SQLAlchemy asyncio. Reported to the DPI team; not part of the integration patch.
+RUN pip install --no-cache-dir --default-timeout=600 "greenlet>=3"

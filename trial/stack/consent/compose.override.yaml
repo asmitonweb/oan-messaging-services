@@ -1,0 +1,3 @@
+# Local verification only (not in the repository).
+networks:
+  oan-trial: {external: true, name: oan-repo-trial}

@@ -1,0 +1,30 @@
+# Consent Manager (DPI) for the integration trial, on the shared oan-trial network.
+# Auth is OFF (dev). OTP delivery goes through the trial OAN API; test numbers only.
+name: oan-trial-consent
+services:
+  cm-db:
+    image: postgres:16-alpine
+    environment: {POSTGRES_DB: consent_manager_db, POSTGRES_PASSWORD: "${CM_DB_PW}"}
+    networks: [oan-trial]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U postgres"], interval: 2s, retries: 30}
+  cm-api:
+    image: "consent-manager:${CM_IMAGE_TAG:-trial-fixed}"
+    env_file: [../../repos/consent-management/backend/.env.example, .env]
+    environment:
+      CONSENT_MANAGER_DB_HOSTNAME: cm-db
+      CONSENT_MANAGER_DB_PASSWORD: "${CM_DB_PW}"
+      CONSENT_MANAGER_NO_OF_WORKERS: "1"
+      CONSENT_MANAGER_AUTH_ENABLED: "false"
+      CONSENT_MANAGER_CRYPTO_BACKEND: local
+      CONSENT_MANAGER_AWE_ENABLED: "false"
+      CONSENT_MANAGER_KAFKA_ENABLED: "false"
+      CONSENT_MANAGER_OTP_PROVIDER: fayda
+      CONSENT_MANAGER_OTP_DEBUG_ENABLED: "false"
+      CONSENT_MANAGER_OAN_BASE_URL: https://oan-api:8000
+      CONSENT_MANAGER_OAN_CA_BUNDLE: /oan/ca.crt
+    volumes: ["../trial-ca.crt:/oan/ca.crt:ro"]
+    networks: [oan-trial]
+    ports: ["127.0.0.1:18200:8000"]
+    depends_on: {cm-db: {condition: service_healthy}}
+networks:
+  oan-trial: {external: true, name: oan-trial}

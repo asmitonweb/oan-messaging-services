@@ -1,0 +1,14 @@
+{
+  "description": "503: outcome uncertain; retry with the same key and unchanged body.",
+  "schema": "Problem",
+  "body": {
+    "title": "Service unavailable",
+    "status": 503,
+    "code": "service_unavailable",
+    "errors": [
+      {
+        "code": "outcome_uncertain_retry_same_key"
+      }
+    ]
+  }
+}

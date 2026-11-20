@@ -1,0 +1,4 @@
+# Local verification only (not in the repository): separate network name so this run
+# does not collide with an existing trial stack.
+networks:
+  oan-trial: {name: oan-repo-trial}

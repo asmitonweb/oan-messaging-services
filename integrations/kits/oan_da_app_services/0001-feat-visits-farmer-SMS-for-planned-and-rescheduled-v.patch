@@ -1,0 +1,346 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OAN Messaging <messaging@example.invalid>
+Date: Tue, 17 Nov 2026 08:32:31 +0530
+Subject: [PATCH] feat(visits): farmer SMS for planned and rescheduled visits
+ through the OAN Messaging Service
+
+When the Development Agent ticks notify_farmer_sms, plan_visit and reschedule_visit
+queue one SMS to the farmer (phone from DA Farmer Reference) with
+oan_messaging_connector.queue_sms: purpose transactional, expiring when the visit starts
+(capped inside the 7-day horizon), source_reference da:visit:<visit>:<event>. A past or
+closed visit, a visit without a farmer phone, or an idempotent replan sends nothing.
+Development Agents are not sent SMS.
+
+Adds oan_messaging_connector to required_apps, fetches it in CI (repository variable\nOAN_MESSAGING_CONNECTOR_REPO), and eight tests.
+---
+ .github/workflows/ci.yml            |   5 ++
+ da_services/hooks.py                |   2 +-
+ da_services/services/visit_sms.py   | 110 +++++++++++++++++++++++
+ da_services/services/visits.py      |   6 +-
+ da_services/tests/test_visit_sms.py | 132 ++++++++++++++++++++++++++++
+ 5 files changed, 253 insertions(+), 2 deletions(-)
+ create mode 100644 da_services/services/visit_sms.py
+ create mode 100644 da_services/tests/test_visit_sms.py
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 2d03732..659182e 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -110,14 +110,19 @@ jobs:
+         working-directory: /home/runner/frappe-bench
+         run: |
+           bench get-app oan_auth_service https://github.com/Centre-for-Open-Societal-Systems/oan_auth_service.git --branch develop || bench get-app oan_auth_service https://github.com/arnavam/oan_auth_service.git --branch develop
++          # oan_messaging_connector is a required app (farmer SMS); set the repository
++          # variable OAN_MESSAGING_CONNECTOR_REPO until it is published under this org.
++          bench get-app oan_messaging_connector "${OAN_MESSAGING_CONNECTOR_REPO:-https://github.com/Centre-for-Open-Societal-Systems/oan_messaging_connector.git}" --branch develop
+           bench get-app da_services $GITHUB_WORKSPACE
+           bench setup requirements --dev
+           bench new-site --db-root-password root --admin-password admin test_site
+           bench --site test_site install-app oan_auth_service
++          bench --site test_site install-app oan_messaging_connector
+           bench --site test_site install-app da_services
+           bench build
+         env:
+           CI: "Yes"
++          OAN_MESSAGING_CONNECTOR_REPO: ${{ vars.OAN_MESSAGING_CONNECTOR_REPO }}
+ 
+       - name: Run Tests
+         working-directory: /home/runner/frappe-bench
+diff --git a/da_services/hooks.py b/da_services/hooks.py
+index c1bc691..184cd8a 100644
+--- a/da_services/hooks.py
++++ b/da_services/hooks.py
+@@ -8,7 +8,7 @@
+ # Apps
+ # ------------------
+ 
+-required_apps = ["oan_auth_service"]
++required_apps = ["oan_auth_service", "oan_messaging_connector"]
+ 
+ # Register Werkzeug REST routes for Frappe API Map
+ before_request = ["da_services.api.router.ensure_routes_registered"]
+diff --git a/da_services/services/visit_sms.py b/da_services/services/visit_sms.py
+new file mode 100644
+index 0000000..d7c0376
+--- /dev/null
++++ b/da_services/services/visit_sms.py
+@@ -0,0 +1,110 @@
++"""Farmer SMS for planned and rescheduled visits, through the OAN Messaging Service.
++
++Sent only when the Development Agent ticked **Notify farmer by SMS**
++(``notify_farmer_sms``) on the visit, and only to the farmer: Development Agents are
++alerted on Telegram, not by SMS.
++
++=============  =====================================================================
++Event          Raised by
++=============  =====================================================================
++planned        ``services.visits.plan_visit``, after a new visit is inserted
++rescheduled    ``services.visits.reschedule_visit``, for the new visit it creates
++=============  =====================================================================
++
++Each event belongs to one visit row (a reschedule creates a new row), so
++``source_reference = da:visit:<visit>:<event>`` is unique per event, and an idempotent
++retry of ``plan_visit`` (same ``client_op_id``) inserts nothing and sends nothing.
++
++The message expires when the visit starts, capped inside OAN's 7-day horizon. A visit
++already started, closed or without a farmer phone sends nothing. ``queue_sms`` only adds
++an outbox row in this transaction; the connector sends it after commit and never raises.
++"""
++
++from __future__ import annotations
++
++from datetime import UTC, datetime, timedelta
++from zoneinfo import ZoneInfo
++
++import frappe
++from frappe.utils import get_datetime, get_system_timezone
++from oan_messaging_connector.api import queue_sms
++from oan_messaging_connector.sms import fits_one_sms
++
++EVENTS = ("planned", "rescheduled")
++TEMPLATES = {
++	"planned": {
++		"en": "OAN: your Development Agent will visit you on {date} at {time}. Visit ref {visit}.",
++	},
++	"rescheduled": {
++		"en": "OAN: your Development Agent visit has moved to {date} at {time}. Visit ref {visit}.",
++	},
++}
++#: Longest values substituted; the tests render every template at these lengths.
++FIELD_LIMITS = {"date": 11, "time": 5, "visit": 20}
++OPEN_FOR_SMS = ("Planned", "Confirmed")
++#: OAN accepts an expiry at most 7 days ahead; stay a little inside it.
++MAX_EXPIRY_HORIZON = timedelta(days=7)
++EXPIRY_SAFETY_MARGIN = timedelta(minutes=5)
++
++
++class TemplateTooLong(ValueError):
++	"""The rendered text does not fit one SMS part."""
++
++
++def render(event: str, language: str = "en", **fields: str) -> str:
++	"""Render ``event``, falling back to English when there is no translation."""
++	for name, value in fields.items():
++		if name in FIELD_LIMITS and len(value) > FIELD_LIMITS[name]:
++			raise TemplateTooLong(f"{name} longer than {FIELD_LIMITS[name]} characters")
++	template = TEMPLATES[event].get(language) or TEMPLATES[event]["en"]
++	text = template.format(**fields)
++	if not fits_one_sms(text):
++		raise TemplateTooLong(f"{event}/{language} does not fit one SMS part")
++	return text
++
++
++def visit_deadline(starts_at: datetime, now: datetime) -> datetime | None:
++	"""When the message stops being useful; None when the visit has already started."""
++	deadline = min(starts_at, now + MAX_EXPIRY_HORIZON - EXPIRY_SAFETY_MARGIN)
++	return deadline if deadline > now else None
++
++
++def _farmer_phone(farmer_id: str | None) -> str | None:
++	"""The farmer's phone from the cached registry record (DA Farmer Reference)."""
++	if not farmer_id:
++		return None
++	phone = frappe.db.get_value("DA Farmer Reference", farmer_id, "phone")
++	return (phone or "").strip() or None
++
++
++def notify_farmer(visit, event: str) -> str | None:
++	"""Queue the farmer SMS for ``event`` on ``visit``; returns the OAN Message name or None."""
++	if event not in EVENTS or not visit.get("notify_farmer_sms"):
++		return None
++	if visit.get("physical_status") not in OPEN_FOR_SMS or not visit.get("scheduled_at"):
++		return None
++	tz = ZoneInfo(get_system_timezone())
++	local = get_datetime(visit.scheduled_at).replace(tzinfo=tz)
++	deadline = visit_deadline(local.astimezone(UTC), datetime.now(UTC))
++	if deadline is None:
++		return None
++	phone = _farmer_phone(visit.get("farmer_id"))
++	if not phone:
++		frappe.log_error(f"Visit SMS not queued for {visit.name}/{event}: no farmer phone", "OAN Messaging")
++		return None
++	try:
++		text = render(event, date=f"{local.day} {local:%b %Y}", time=f"{local:%H:%M}", visit=visit.name)
++	except TemplateTooLong as exc:
++		frappe.log_error(f"Visit SMS not queued for {visit.name}/{event}: {exc}", "OAN Messaging")
++		return None
++	return queue_sms(
++		recipient=phone,
++		text=text,
++		purpose="transactional",
++		source_reference=f"da:visit:{visit.name}:{event}",
++		reference_doctype="DA Visit",
++		reference_name=visit.name,
++		event=f"visit_{event}",
++		language="en",
++		expires_at=deadline,
++	)
+diff --git a/da_services/services/visits.py b/da_services/services/visits.py
+index 96e5f16..b07120d 100644
+--- a/da_services/services/visits.py
++++ b/da_services/services/visits.py
+@@ -24,6 +24,7 @@
+ 	PLANNED_STATES,
+ 	RESCHEDULED,
+ )
++from da_services.services import visit_sms
+ from da_services.services import visit_specializations as spec_svc
+ 
+ # Open visits block another visit that covers the same specialization.
+@@ -261,6 +262,7 @@ def plan_visit(
+ 
+ 	spec_svc.set_visit_specializations(doc, new_specializations)
+ 	doc.insert()
++	visit_sms.notify_farmer(doc, "planned")
+ 	return serialize(doc)
+ 
+ 
+@@ -583,7 +585,9 @@ def activity_report(*, week: str | None = None, da_id: str | None = None) -> dic
+ 
+ def reschedule_visit(name: str, *, scheduled_at, reason: str | None = None) -> dict:
+ 	doc = frappe.get_doc("DA Visit", name)
+-	return serialize(doc.reschedule(scheduled_at, reason))
++	new = doc.reschedule(scheduled_at, reason)
++	visit_sms.notify_farmer(new, "rescheduled")
++	return serialize(new)
+ 
+ 
+ def cancel_visit(name: str, *, reason: str | None = None) -> dict:
+diff --git a/da_services/tests/test_visit_sms.py b/da_services/tests/test_visit_sms.py
+new file mode 100644
+index 0000000..5695119
+--- /dev/null
++++ b/da_services/tests/test_visit_sms.py
+@@ -0,0 +1,132 @@
++"""Farmer SMS for planned and rescheduled visits (services/visit_sms.py).
++
++Drives the real plan and reschedule services; nothing is sent from here (the connector's
++own tests cover dispatch and polling).
++"""
++
++from datetime import UTC, datetime, timedelta
++from unittest import mock
++
++import frappe
++from frappe.tests import IntegrationTestCase
++from frappe.utils import add_days, add_to_date, now_datetime, today
++
++from da_services.services import constants as C
++from da_services.services import visit_sms, visits
++from da_services.tests.fixtures import (
++	cleanup_test_rows,
++	ensure_kebele_assignment,
++	live_geo,
++	set_da_registry_id,
++)
++from da_services.tests.test_visits import _grant, _user
++
++DA = "visit-sms-da@da.local"
++DA_ID = "DA-000001"
++FARMER = "FR-SMS-TEST-1"
++PHONE = "0900000741"
++
++
++class TestVisitSms(IntegrationTestCase):
++	def setUp(self):
++		frappe.set_user("Administrator")
++		cleanup_test_rows(users=(DA,), da_ids=(DA_ID,))
++		geo = live_geo()
++		_user(DA, [C.ROLE_DA])
++		set_da_registry_id(DA, DA_ID)
++		_grant(DA, C.ROLE_DA, da_id=DA_ID, region_scope=geo["region"], woreda_scope=geo["woreda"])
++		ensure_kebele_assignment(DA_ID, geo["kebele"])
++		if not frappe.db.exists("DA Farmer Reference", FARMER):
++			farmer = frappe.get_doc(
++				{
++					"doctype": "DA Farmer Reference",
++					"farmer_id": FARMER,
++					"farmer_name": "SMS Test",
++					"phone": PHONE,
++				}
++			)
++			farmer.flags.ignore_mandatory = True
++			farmer.insert(ignore_permissions=True)
++
++		keys = ("oan_messaging_enabled", "oan_messaging_base_url", "oan_messaging_token")
++		self._conf = {k: frappe.conf.get(k) for k in keys}
++		frappe.conf.oan_messaging_enabled = 1
++		frappe.conf.oan_messaging_base_url = "https://oan-messaging.example.invalid"
++		frappe.conf.oan_messaging_token = "oanmsg_" + "t" * 43
++		enqueue = mock.patch.object(frappe, "enqueue")  # no dispatch job from the tests
++		enqueue.start()
++		self.addCleanup(enqueue.stop)
++		self.tomorrow = f"{add_days(today(), 1)} 09:00:00"
++
++	def tearDown(self):
++		frappe.set_user("Administrator")
++		for k, v in self._conf.items():
++			frappe.conf[k] = v
++		visit_names = frappe.get_all("DA Visit", filters={"farmer_id": FARMER}, pluck="name")
++		if visit_names:
++			frappe.db.delete("OAN Message", {"reference_name": ["in", visit_names]})
++		frappe.db.delete("DA Farmer Reference", {"farmer_id": FARMER})
++		cleanup_test_rows(users=(DA,), da_ids=(DA_ID,))
++		frappe.db.commit()  # nosemgrep: frappe-semgrep-rules.rules.frappe-manual-commit
++
++	def plan(self, **kw):
++		args = {"farmer_id": FARMER, "scheduled_at": self.tomorrow, "user": DA, "notify_farmer_sms": True}
++		args.update(kw)
++		return visits.plan_visit(**args)
++
++	def messages(self, visit_name):
++		return frappe.get_all(
++			"OAN Message",
++			filters={"reference_doctype": "DA Visit", "reference_name": visit_name},
++			fields=["event", "recipient", "purpose", "source_reference", "expires_at", "text"],
++		)
++
++	def test_planned_visit_with_sms_ticked_queues_one_farmer_sms(self):
++		visit = self.plan()
++		(m,) = self.messages(visit["name"])
++		self.assertEqual((m.event, m.recipient, m.purpose), ("visit_planned", PHONE, "transactional"))
++		self.assertEqual(m.source_reference, f"da:visit:{visit['name']}:planned")
++		self.assertIn(visit["name"], m.text)
++		self.assertIsNotNone(m.expires_at)
++
++	def test_no_sms_unless_ticked(self):
++		visit = self.plan(notify_farmer_sms=False)
++		self.assertEqual(self.messages(visit["name"]), [])
++
++	def test_idempotent_replan_sends_nothing_new(self):
++		first = self.plan(client_op_id="op-visit-sms-1")
++		again = self.plan(client_op_id="op-visit-sms-1")
++		self.assertEqual(first["name"], again["name"])
++		self.assertEqual(len(self.messages(first["name"])), 1)
++
++	def test_reschedule_tells_the_farmer_the_new_time(self):
++		visit = self.plan()
++		new = visits.reschedule_visit(visit["name"], scheduled_at=f"{add_days(today(), 2)} 10:30:00")
++		(m,) = self.messages(new["name"])
++		self.assertEqual(m.event, "visit_rescheduled")
++		self.assertIn("10:30", m.text)
++		self.assertEqual(len(self.messages(visit["name"])), 1)  # the original keeps its one SMS
++
++	def test_past_visit_sends_nothing(self):
++		visit = self.plan(scheduled_at=add_to_date(now_datetime(), hours=-3))
++		self.assertEqual(self.messages(visit["name"]), [])
++
++	def test_no_farmer_phone_sends_nothing(self):
++		frappe.db.set_value("DA Farmer Reference", FARMER, "phone", "")
++		visit = self.plan()
++		self.assertEqual(self.messages(visit["name"]), [])
++
++	def test_deadline_is_capped_inside_the_expiry_horizon(self):
++		now = datetime.now(UTC)
++		self.assertEqual(visit_sms.visit_deadline(now + timedelta(days=2), now), now + timedelta(days=2))
++		self.assertEqual(
++			visit_sms.visit_deadline(now + timedelta(days=30), now),
++			now + visit_sms.MAX_EXPIRY_HORIZON - visit_sms.EXPIRY_SAFETY_MARGIN,
++		)
++		self.assertIsNone(visit_sms.visit_deadline(now - timedelta(minutes=1), now))
++
++	def test_every_template_fits_one_sms_at_maximum_field_lengths(self):
++		fields = {k: "W" * n for k, n in visit_sms.FIELD_LIMITS.items()}
++		for event, texts in visit_sms.TEMPLATES.items():
++			for language in texts:
++				visit_sms.render(event, language, **fields)  # raises TemplateTooLong if not

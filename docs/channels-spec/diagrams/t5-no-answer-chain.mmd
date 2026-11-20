@@ -1,0 +1,18 @@
+%% No-answer chain (both routing modes). Waits are working days, configurable per region. A reply at any step ends the chain.
+flowchart TB
+  Q(["Question delivered"]) --> M{"Routing mode"}
+  M -- "specialism" --> A["Assigned Development Agent<br/>(same agent as last time if eligible,<br/>else next in turn)"]
+  A -- "1 working day, no reply" --> R1["Reminder to the agent<br/>farmer told it is still with them"]
+  R1 -- "1 more working day" --> P{"Agents passed over<br/>on this question?"}
+  P -- "fewer than 2, and another<br/>eligible agent exists" --> N["Next eligible agent in turn<br/>(fresh timers)<br/>farmer told once"]
+  N --> A
+  P -- "2 passed over, or<br/>no eligible agent left" --> O
+  M -- "kebele_inbox" --> I["Offer to every eligible agent<br/>in their own chat:<br/>'I will answer Q-123'"]
+  I -- "first tap claims" --> C["Claimed: others told<br/>'Being answered by {name}'"]
+  C -- "1 working day, no reply" --> CR["Reminder to the claimer"]
+  CR -- "1 more working day" --> O
+  I -- "1 working day, unclaimed" --> IR["One reminder to all offered agents"]
+  IR -- "1 more working day" --> O
+  O["Extension Department Woreda Officer<br/>(own chat): Assign to a Development Agent<br/>or I will answer"]
+  O -- "assigns" --> A2["Chosen agent, fresh timers;<br/>silent through both waits:<br/>back to the officer"]
+  O -- "1 working day, no action" --> OR["One reminder to the officer;<br/>question stays with the officer"]

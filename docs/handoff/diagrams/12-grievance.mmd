@@ -1,0 +1,9 @@
+%% Grievance: only the SMS send step changes (kit)
+flowchart TB
+  N["Notification event<br/>(submission_received, status_rejected, ...)"] --> Q["queue(): render per recipient language<br/>Grievance Notification Log row (Queued)"]
+  Q --> D["dispatch_queued() worker<br/>(existing lock + per-row commit)"]
+  D -->|"Email / System"| X["unchanged paths"]
+  D -->|"SMS, OAN configured"| C[["queue_sms() via oan_messaging_connector<br/>row: Queued with OAN, links its OAN Message"]]
+  D -->|"SMS, no OAN"| F["Frappe sender, unchanged"]
+  C --> OAN["OAN Messaging"] --> P(["Farmer phone"])
+  C -. "connector polls" .-> L["OAN Message: Submitted, sent, delivered"]

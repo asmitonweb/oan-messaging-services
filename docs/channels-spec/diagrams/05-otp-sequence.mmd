@@ -1,0 +1,17 @@
+%% OTP senders: Auth, eSignet, DPI Consent Manager (send now, never store the code)
+sequenceDiagram
+  autonumber
+  actor F as Farmer
+  participant S as Service<br/>(Auth / eSignet / Consent Manager)
+  participant OAN as OAN API
+  participant P as 8028 gateway
+  F->>S: request code (login, reset, consent)
+  S->>S: generate code, store only its hash + expiry
+  S->>OAN: POST /messages/sms, purpose = otp<br/>expires_at = the code's own expiry<br/>key = per issue (resend = new key)
+  OAN-->>S: 202 accepted
+  Note over S: text with the code is never stored<br/>or logged by the service
+  OAN->>P: send (only before expires_at)
+  P->>F: SMS with code
+  F->>S: enter code
+  S->>S: verify against hash (OAN is not involved)
+  Note over S,OAN: delivery never proves identity:<br/>only the service's own verify step does

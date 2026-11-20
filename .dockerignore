@@ -1,0 +1,7 @@
+# Build context: only what the image needs.
+*
+!deploy/docker/requirements.txt
+!oan_messaging/
+!migrations/
+**/__pycache__
+**/*.pyc

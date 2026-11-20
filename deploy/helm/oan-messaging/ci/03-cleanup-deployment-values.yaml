@@ -1,0 +1,7 @@
+# Cleanup as one long-running loop instead of a CronJob; NetworkPolicy off.
+cleanup:
+  enabled: true
+  mode: deployment
+  command: [python, -m, oan_messaging.runtime, cleanup, --forever]
+networkPolicy: {enabled: false}
+api: {replicas: 1}

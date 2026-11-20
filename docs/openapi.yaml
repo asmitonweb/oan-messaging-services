@@ -1,0 +1,889 @@
+openapi: 3.1.0
+info:
+  title: OAN Messaging Service
+  version: 3.2.0
+  summary: Outbound SMS (8028) and Telegram with durable acceptance and honest outcomes.
+  description: |
+    Frozen by MSG-01 (contract 3.0.0). Python mirror: `oan_messaging/contracts.py`.
+
+    ## Outcomes — do not conflate
+    | status | meaning | handset claim? |
+    |---|---|---|
+    | `accepted` | Durably stored. Nothing has left the service. | no |
+    | `sending` | A worker committed an attempt and is calling the provider. | no |
+    | `sent` | Provider confirmed it took the message (8028 `sms_id`, Telegram `message_id`). | **no** |
+    | `delivered` | 8028 reported handset delivery. SMS only; Telegram never reaches this. | yes |
+    | `failed` | Definite non-delivery as reported by the provider (rejected, bot blocked, chat not found, gateway delivery expiry). | — |
+    | `expired` | `expires_at` passed before any provider submission. The message never left the service. | — |
+    | `unknown` | A provider submission was attempted but acceptance cannot be proven (timeout, 5xx, malformed/partial success, crash). **Never resent automatically.** | unknown |
+
+    Final statuses: `delivered`, `failed`, `expired`. `sent` and `unknown` may still change
+    when a provider receipt arrives. Telegram messages report
+    `delivery_receipts_supported: false` and can never be `delivered`.
+
+    ## Idempotency-Key and source_reference
+    * `Idempotency-Key` (header, required) identifies **one intended delivery**. Use one
+      stable key per delivery and reuse it on every retry of that delivery. Scope:
+      (authenticated caller, channel). Use a random UUID or another opaque per-delivery
+      identifier. Never put OTPs, phone numbers or other personal data in keys or in
+      `source_reference`. Never recycle a key for a different delivery.
+    * `source_reference` (body, required) is the caller's business event ID. It is **not**
+      unique: one event that notifies several recipients sends several deliveries with the
+      same `source_reference` and different keys.
+    * Same key + identical body → the original message, HTTP 200, including after the
+      message content was purged and after its `expires_at` passed. Retries must resend
+      the original text and `expires_at` exactly (text is compared byte-exact; equivalent
+      phone formats and equivalent UTC instants canonicalize the same).
+    * Same key + different body → 409.
+    * The binding is kept for as long as the message is `accepted`, `sending` or `unknown`,
+      however old. A completed message's binding (`sent`, `delivered`, `failed`, `expired`)
+      is kept for at least the guarantee window (default 30 days) and may be released
+      afterwards. A retry beyond the guarantee window is therefore not automatically safe:
+      reconcile with `GET /api/v1/messages/{id}` instead of submitting again, and never
+      switch to a new key for the same delivery.
+
+    ## Retrying API calls (safe) vs. gateway resends (never)
+    If a `POST` times out, the connection drops, or the response is any 5xx (including 503),
+    the caller **cannot know** whether the message was stored — a commit can succeed while
+    its response is lost. Retry with the **same** `Idempotency-Key` and the **unchanged**
+    body; the service returns either the original message (200) or a single new acceptance
+    (202). This is safe API replay. It is unrelated to the service's own gateway calls,
+    which are never blindly resent after an ambiguous provider response (`unknown`).
+
+    ## Redaction and retention
+    Error bodies never echo submitted values. Status responses never contain message text
+    and show only a masked recipient. Message content is deleted once no send can happen
+    any more (including after `sent`); only keyed fingerprints and metadata are retained.
+    `GET` keeps working after content purge and after the idempotency binding is released.
+servers:
+  - url: http://localhost:8000
+    description: Local development (mocks only)
+security:
+  - serviceToken: []
+paths:
+  /api/v1/messages/sms:
+    post:
+      operationId: submitSms
+      summary: Accept one SMS for one Ethiopian mobile recipient
+      description: |
+        Persists the message before responding. No gateway call happens in this request.
+        The text may take up to 3 SMS parts (SMS-09). One part holds 160 GSM-7 septets,
+        or 70 UTF-16 units if any non-GSM character such as Amharic or emoji is present;
+        a longer text is sent concatenated at 153 septets or 67 units per part, so at
+        most 459 septets or 201 units. An `otp` text must fit one part. Longer text is
+        refused (`too_long_for_sms`, or `too_long_for_single_sms` for an OTP), never cut.
+        `purpose: otp` requires `expires_at`, at most the configured OTP ceiling ahead
+        (default 30 minutes). The service never extends a caller's `expires_at`.
+      tags: [messages]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SmsSubmission'
+            examples:
+              otp:
+                summary: OTP (expiry mandatory); header example `otp`
+                value:
+                  recipient: '+251912000001'
+                  text: Your OAN code is 482913. It expires in 5 minutes.
+                  source_reference: esignet:otp:7f3c9a
+                  purpose: otp
+                  expires_at: '2026-09-01T05:17:13Z'
+              shared_event_recipient_1:
+                summary: One grievance event, first recipient; header example `shared_event_recipient_1`
+                value:
+                  recipient: '0912000003'
+                  text: Grievance G-1042 was updated.
+                  source_reference: grievance:G-1042:update:3
+                  purpose: transactional
+              shared_event_recipient_2:
+                summary: Same event, second recipient (different key); header example `shared_event_recipient_2`
+                value:
+                  recipient: '0912000004'
+                  text: Grievance G-1042 was updated.
+                  source_reference: grievance:G-1042:update:3
+                  purpose: transactional
+              amharic_broadcast:
+                summary: Amharic advisory, domestic number format
+                value:
+                  recipient: '0712000002'
+                  text: እንደምን አደርሩ! የእርሻ ምክር ለማግኘት 8028 ይደውሉ።
+                  source_reference: advisory:2026-09-01:w12
+                  purpose: broadcast
+              invalid_otp_without_expiry:
+                summary: Rejected with 422 — OTP without expires_at
+                value:
+                  recipient: '0912000001'
+                  text: Code 1
+                  source_reference: x1
+                  purpose: otp
+              invalid_landline:
+                summary: Rejected with 422 — not a 09/07 mobile number
+                value:
+                  recipient: '0111000000'
+                  text: hi
+                  source_reference: x3
+                  purpose: alert
+              invalid_key_in_body:
+                summary: Rejected with 422 — the key belongs in the header
+                value:
+                  recipient: '0912000001'
+                  text: hi
+                  source_reference: x6b
+                  purpose: alert
+                  idempotency_key: body-is-not-allowed
+      responses:
+        '202':
+          $ref: '#/components/responses/Accepted'
+        '200':
+          $ref: '#/components/responses/Replayed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/IdempotencyConflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/v1/messages/telegram:
+    post:
+      operationId: submitTelegram
+      summary: Accept one plain-text Telegram message for an already-known chat
+      description: |
+        The recipient must already have started the caller's bot; Telegram does not let a
+        bot message a user first. The bot is chosen from the authenticated caller's
+        configuration — the request cannot name a bot token or URL. Text is sent without
+        `parse_mode` and must not exceed 4096 UTF-16 units. A successful send ends at
+        `sent`: the Bot API has no handset delivery receipts.
+      tags: [messages]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TelegramSubmission'
+            examples:
+              grievance_update:
+                summary: Grievance update via Telegram (its own opaque key)
+                value:
+                  chat_id: 123456789
+                  text: Your grievance G-1042 was updated.
+                  source_reference: grievance:G-1042:update:3
+                  purpose: transactional
+              invalid_token_in_request:
+                summary: Rejected with 422 — unknown field (no tokens in requests)
+                value:
+                  chat_id: 1
+                  text: hi
+                  source_reference: x7
+                  purpose: alert
+                  bot_token: '123:ABC'
+      responses:
+        '202':
+          $ref: '#/components/responses/Accepted'
+        '200':
+          $ref: '#/components/responses/Replayed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/IdempotencyConflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/v1/messages/{id}:
+    get:
+      operationId: getMessage
+      summary: Current status of a message submitted by the calling service
+      description: |
+        Returns 404 both for unknown ids and for messages owned by another caller.
+      tags: [messages]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Current status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageStatusView'
+              examples:
+                accepted:
+                  summary: Stored, not yet handed to the provider
+                  value:
+                    id: 0b9f3a52-5c1e-4d55-9b7a-3f1c2a7e9d10
+                    idempotency_key: 6f1d2c3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f
+                    channel: sms
+                    purpose: otp
+                    source_reference: esignet:otp:7f3c9a
+                    status: accepted
+                    final: false
+                    recipient_masked: '+2519******01'
+                    delivery_receipts_supported: true
+                    attempts: 0
+                    created_at: '2026-09-01T05:12:13Z'
+                    updated_at: '2026-09-01T05:12:13Z'
+                    expires_at: '2026-09-01T05:17:13Z'
+                sent:
+                  summary: 8028 queued it (sms_id stored); no handset report yet
+                  value:
+                    id: 0b9f3a52-5c1e-4d55-9b7a-3f1c2a7e9d10
+                    idempotency_key: 6f1d2c3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f
+                    channel: sms
+                    purpose: otp
+                    source_reference: esignet:otp:7f3c9a
+                    status: sent
+                    final: false
+                    provider_status: http_200
+                    recipient_masked: '+2519******01'
+                    delivery_receipts_supported: true
+                    attempts: 1
+                    created_at: '2026-09-01T05:12:13Z'
+                    updated_at: '2026-09-01T05:12:14Z'
+                    expires_at: '2026-09-01T05:17:13Z'
+                    sent_at: '2026-09-01T05:12:14Z'
+                delivered:
+                  summary: 8028 callback reported Delivered
+                  value:
+                    id: 0b9f3a52-5c1e-4d55-9b7a-3f1c2a7e9d10
+                    idempotency_key: 6f1d2c3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f
+                    channel: sms
+                    purpose: otp
+                    source_reference: esignet:otp:7f3c9a
+                    status: delivered
+                    final: true
+                    provider_status: Delivered
+                    recipient_masked: '+2519******01'
+                    delivery_receipts_supported: true
+                    attempts: 1
+                    created_at: '2026-09-01T05:12:13Z'
+                    updated_at: '2026-09-01T05:12:19Z'
+                    expires_at: '2026-09-01T05:17:13Z'
+                    sent_at: '2026-09-01T05:12:14Z'
+                    delivered_at: '2026-09-01T05:12:19Z'
+                unknown:
+                  summary: Gateway timed out after the request was sent; not resent
+                  value:
+                    id: 0b9f3a52-5c1e-4d55-9b7a-3f1c2a7e9d10
+                    idempotency_key: 6f1d2c3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f
+                    channel: sms
+                    purpose: otp
+                    source_reference: esignet:otp:7f3c9a
+                    status: unknown
+                    final: false
+                    failure_code: timeout
+                    provider_status: timeout
+                    recipient_masked: '+2519******01'
+                    delivery_receipts_supported: true
+                    attempts: 1
+                    created_at: '2026-09-01T05:12:13Z'
+                    updated_at: '2026-09-01T05:12:29Z'
+                    expires_at: '2026-09-01T05:17:13Z'
+                gateway_expired:
+                  summary: 8028 callback reported Expired (delivery validity ran out; cause not proven)
+                  value:
+                    id: 0b9f3a52-5c1e-4d55-9b7a-3f1c2a7e9d10
+                    idempotency_key: 4d5e6f7a-8b9c-4d0e-a1f2-3b4c5d6e7f80
+                    channel: sms
+                    purpose: broadcast
+                    source_reference: advisory:2026-09-01:w12
+                    status: failed
+                    final: true
+                    failure_code: provider_delivery_expired
+                    provider_status: Expired
+                    recipient_masked: '+2517******02'
+                    delivery_receipts_supported: true
+                    attempts: 1
+                    created_at: '2026-09-01T05:12:13Z'
+                    updated_at: '2026-09-02T05:12:13Z'
+                    sent_at: '2026-09-01T05:12:14Z'
+                expired:
+                  summary: OTP expired in the queue; never submitted to 8028
+                  value:
+                    id: 0b9f3a52-5c1e-4d55-9b7a-3f1c2a7e9d10
+                    idempotency_key: 6f1d2c3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f
+                    channel: sms
+                    purpose: otp
+                    source_reference: esignet:otp:7f3c9a
+                    status: expired
+                    final: true
+                    failure_code: expired_before_send
+                    recipient_masked: '+2519******01'
+                    delivery_receipts_supported: true
+                    attempts: 0
+                    created_at: '2026-09-01T05:12:13Z'
+                    updated_at: '2026-09-01T05:17:13Z'
+                    expires_at: '2026-09-01T05:17:13Z'
+                telegram_sent:
+                  summary: Bot API ok — strongest outcome Telegram can report
+                  value:
+                    id: 5d1e7c0a-2b4f-4a8e-8c61-0e9b7d3f2a11
+                    idempotency_key: b3e8c1d4-2f6a-4b7c-8d9e-0a1b2c3d4e5f
+                    channel: telegram
+                    purpose: transactional
+                    source_reference: grievance:G-1042:update:3
+                    status: sent
+                    final: false
+                    provider_status: tg_200
+                    recipient_masked: chat:*******89
+                    delivery_receipts_supported: false
+                    attempts: 1
+                    created_at: '2026-09-01T05:12:13Z'
+                    updated_at: '2026-09-01T05:12:14Z'
+                    sent_at: '2026-09-01T05:12:14Z'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/charts/{chartId}:
+    get:
+      operationId: getChart
+      summary: Statistics for the OAN dashboards (one chart)
+      description: |
+        The dashboard service contract of the OAN dashboards (as A2C and Grievance), read by
+        Reports Central. Only for a statistics reader: a credential created with
+        `caller --stats-reader`, which has no channels and no purposes and cannot send.
+        Rows are counts only, never a recipient, text or reference. Charts other than
+        `msgQueueNow`, `msgProviderHealth` and `msgFilterCallers` come from a snapshot
+        rebuilt every 15 minutes; `meta.as_of` says when (null before the first rebuild).
+        Days are Ethiopian calendar days (Africa/Addis_Ababa) of acceptance. Unknown query
+        parameters are ignored.
+
+        Charts: `msgKpis`, `msgTrend`, `msgByCaller`, `msgByPurpose`, `msgFailureReasons`,
+        `msgOtpLatency`, `msgCampaigns`, `msgQueueNow`, `msgProviderHealth`,
+        `msgFilterCallers`.
+      tags: [charts]
+      parameters:
+        - name: chartId
+          in: path
+          required: true
+          schema: {type: string}
+        - $ref: '#/components/parameters/ChartFrom'
+        - $ref: '#/components/parameters/ChartTo'
+        - $ref: '#/components/parameters/ChartGranularity'
+        - $ref: '#/components/parameters/ChartCaller'
+        - $ref: '#/components/parameters/ChartPurpose'
+        - $ref: '#/components/parameters/ChartChannel'
+      responses:
+        '200':
+          description: Chart rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChartResponse'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/v1/charts:
+    get:
+      operationId: getCharts
+      summary: Several charts at once
+      description: |
+        `charts` is a comma-separated list of chart ids (at most 20). `data` maps each id
+        to `{chartName, data}`. Same filters, access and errors as one chart.
+      tags: [charts]
+      parameters:
+        - name: charts
+          in: query
+          required: true
+          schema: {type: string}
+        - $ref: '#/components/parameters/ChartFrom'
+        - $ref: '#/components/parameters/ChartTo'
+        - $ref: '#/components/parameters/ChartGranularity'
+        - $ref: '#/components/parameters/ChartCaller'
+        - $ref: '#/components/parameters/ChartPurpose'
+        - $ref: '#/components/parameters/ChartChannel'
+      responses:
+        '200':
+          description: Chart rows by chart id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChartsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+components:
+  securitySchemes:
+    serviceToken:
+      type: http
+      scheme: bearer
+      description: |
+        Opaque credential issued separately to each calling service (MSG-02). Grants
+        caller-scoped access to its own messages and an allow-list of channels and
+        purposes.
+  parameters:
+    ChartFrom:
+      name: from
+      in: query
+      description: First Ethiopian calendar day, YYYY-MM-DD (default 29 days before `to`).
+      schema: {type: string, format: date}
+    ChartTo:
+      name: to
+      in: query
+      description: Last day, YYYY-MM-DD (default today). At most 366 days in all.
+      schema: {type: string, format: date}
+    ChartGranularity:
+      name: granularity
+      in: query
+      schema: {type: string, enum: [day, week, month], default: day}
+    ChartCaller:
+      name: caller
+      in: query
+      description: Comma-separated caller ids (modules).
+      schema: {type: string}
+    ChartPurpose:
+      name: purpose
+      in: query
+      description: Comma-separated purposes.
+      schema: {type: string}
+    ChartChannel:
+      name: channel
+      in: query
+      description: Comma-separated channels.
+      schema: {type: string}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        One stable key per intended delivery, reused on every retry of that delivery.
+        Scoped to (caller, channel). Distinct from `source_reference`. Opaque (random UUID
+        recommended); must not contain OTPs, phone numbers or other personal data. 8–128
+        characters.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9][A-Za-z0-9._:\-]{7,127}$'
+      examples:
+        otp:
+          value: 6f1d2c3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f
+        shared_event_recipient_1:
+          value: 1c9e4f7a-3b2d-4e8f-a6c5-9d0b1e2f3a4b
+        shared_event_recipient_2:
+          value: 8a7b6c5d-4e3f-4a1b-9c8d-7e6f5a4b3c2d
+  responses:
+    Accepted:
+      description: Accepted and durably stored. Not sent, not delivered.
+      headers:
+        Location:
+          description: /api/v1/messages/{id}
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/SubmissionResponse'
+          examples:
+            accepted:
+              value:
+                id: 0b9f3a52-5c1e-4d55-9b7a-3f1c2a7e9d10
+                idempotency_key: 6f1d2c3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f
+                channel: sms
+                status: accepted
+                source_reference: esignet:otp:7f3c9a
+                created_at: '2026-09-01T05:12:13Z'
+                expires_at: '2026-09-01T05:17:13Z'
+    Replayed:
+      description: |
+        Identical replay (same caller, channel, Idempotency-Key and body) while the binding
+        is retained (always while accepted/sending/unknown; at least the guarantee window
+        once completed). Same id; `status` is the message's current status. Returned
+        even after content purge and after `expires_at` — expiry is only validated for new
+        acceptances.
+      headers:
+        Location:
+          description: /api/v1/messages/{id}
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/SubmissionResponse'
+          examples:
+            replay_after_expiry:
+              value:
+                id: 0b9f3a52-5c1e-4d55-9b7a-3f1c2a7e9d10
+                idempotency_key: 6f1d2c3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f
+                channel: sms
+                status: sent
+                source_reference: esignet:otp:7f3c9a
+                created_at: '2026-09-01T05:12:13Z'
+                expires_at: '2026-09-01T05:17:13Z'
+    Unauthenticated:
+      description: Missing, malformed or revoked service credential.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            unauthenticated:
+              value: {title: Unauthenticated, status: 401, code: unauthenticated}
+    Forbidden:
+      description: Caller is not permitted this channel or purpose.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            purpose_not_permitted:
+              value:
+                title: Forbidden
+                status: 403
+                code: forbidden
+                errors: [{field: purpose, code: purpose_not_permitted}]
+    NotFound:
+      description: No such message for this caller.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            not_found:
+              value: {title: Not Found, status: 404, code: not_found}
+    IdempotencyConflict:
+      description: |
+        This Idempotency-Key is already bound (for this caller and channel) to a message
+        with a different body. Detected from retained fingerprints, also after purge.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            conflict:
+              value:
+                title: Idempotency conflict
+                status: 409
+                code: idempotency_conflict
+                errors: [{field: header.Idempotency-Key, code: payload_mismatch}]
+    PayloadTooLarge:
+      description: Request body exceeds the service limit.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnsupportedMediaType:
+      description: Body must be application/json (UTF-8).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ValidationFailed:
+      description: Invalid request. Field locations and codes only; submitted values are never echoed.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            missing_idempotency_key:
+              value:
+                title: Validation failed
+                status: 422
+                code: validation_failed
+                errors: [{field: header.Idempotency-Key, code: required}]
+            otp_missing_expiry:
+              value:
+                title: Validation failed
+                status: 422
+                code: validation_failed
+                errors: [{field: expires_at, code: required_for_otp}]
+            recipient_rejected:
+              value:
+                title: Validation failed
+                status: 422
+                code: validation_failed
+                errors: [{field: recipient, code: invalid_et_mobile}]
+    ServiceUnavailable:
+      description: |
+        The service could not complete the request. The caller must treat the outcome as
+        uncertain (the message may or may not have been stored) and retry with the same
+        Idempotency-Key and unchanged body. The same applies to timeouts and dropped
+        connections.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    ChartResponse:
+      type: object
+      required: [success, data, meta]
+      properties:
+        success: {type: boolean, const: true}
+        data:
+          type: array
+          items: {type: object}
+        meta: {$ref: '#/components/schemas/ChartMeta'}
+    ChartsResponse:
+      type: object
+      required: [success, data, meta]
+      properties:
+        success: {type: boolean, const: true}
+        data:
+          type: object
+          additionalProperties:
+            type: object
+            required: [chartName, data]
+            properties:
+              chartName: {type: string}
+              data: {type: array, items: {type: object}}
+        meta: {$ref: '#/components/schemas/ChartMeta'}
+    ChartMeta:
+      type: object
+      properties:
+        as_of: {type: [string, 'null'], format: date-time}
+        chart: {type: string}
+        from: {type: string, format: date}
+        to: {type: string, format: date}
+        granularity: {type: string, enum: [day, week, month]}
+    Channel:
+      type: string
+      enum: [sms, telegram]
+    Purpose:
+      type: string
+      enum: [otp, transactional, alert, broadcast]
+      description: |
+        Priority (worker claim order): otp > transactional > alert > broadcast.
+        Callers are authorized per purpose.
+    MessageStatus:
+      type: string
+      enum: [accepted, sending, sent, delivered, failed, expired, unknown]
+    FailureCode:
+      type: string
+      description: What the provider reported or what the service observed — not a proven root cause.
+      enum:
+        - invalid_recipient
+        - text_rejected
+        - recipient_blocked_bot
+        - chat_not_found
+        - provider_rejected
+        - provider_delivery_expired
+        - provider_auth
+        - provider_config
+        - rate_limited
+        - provider_unavailable
+        - timeout
+        - provider_server_error
+        - malformed_response
+        - interrupted
+        - expired_before_send
+    SourceReference:
+      type: string
+      pattern: '^[A-Za-z0-9][A-Za-z0-9._:\-]{0,127}$'
+      description: Caller's business event ID for correlation. Not unique; not the idempotency key.
+    IdempotencyKeyValue:
+      type: string
+      pattern: '^[A-Za-z0-9][A-Za-z0-9._:\-]{7,127}$'
+    Timestamp:
+      type: string
+      format: date-time
+      description: RFC 3339 with an explicit offset; naive times are rejected.
+    SmsSubmission:
+      type: object
+      additionalProperties: false
+      required: [recipient, text, source_reference, purpose]
+      properties:
+        recipient:
+          type: string
+          pattern: '^(\+?251[79][0-9]{8}|0[79][0-9]{8})$'
+          description: Ethiopian mobile (09/07 series). Stored as E.164.
+        text:
+          type: string
+          minLength: 1
+          maxLength: 459
+          description: |
+            At most 3 SMS parts: ≤459 GSM-7 septets (extension characters count 2), or
+            ≤201 UTF-16 units if any non-GSM-7 character is present (one part: 160 / 70;
+            each part of a longer text: 153 / 67, and a 2-unit character is never split
+            between parts). `otp`: one part only. Encoding-aware check is enforced
+            server-side.
+        source_reference:
+          $ref: '#/components/schemas/SourceReference'
+        purpose:
+          $ref: '#/components/schemas/Purpose'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+      if:
+        properties:
+          purpose: {const: otp}
+        required: [purpose]
+      then:
+        required: [expires_at]
+    TelegramSubmission:
+      type: object
+      additionalProperties: false
+      required: [chat_id, text, source_reference, purpose]
+      properties:
+        chat_id:
+          type: integer
+          not: {const: 0}
+          minimum: -4503599627370495
+          maximum: 4503599627370495
+          description: Known Telegram chat id. The user must have started the caller's bot.
+        text:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: Plain text, no markup; ≤4096 UTF-16 units.
+        source_reference:
+          $ref: '#/components/schemas/SourceReference'
+        purpose:
+          $ref: '#/components/schemas/Purpose'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+      if:
+        properties:
+          purpose: {const: otp}
+        required: [purpose]
+      then:
+        required: [expires_at]
+    SubmissionResponse:
+      type: object
+      additionalProperties: false
+      required: [id, idempotency_key, channel, status, source_reference, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        idempotency_key: {$ref: '#/components/schemas/IdempotencyKeyValue'}
+        channel: {$ref: '#/components/schemas/Channel'}
+        status: {$ref: '#/components/schemas/MessageStatus'}
+        source_reference: {$ref: '#/components/schemas/SourceReference'}
+        created_at: {$ref: '#/components/schemas/Timestamp'}
+        expires_at: {$ref: '#/components/schemas/Timestamp'}
+    MessageStatusView:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - idempotency_key
+        - channel
+        - purpose
+        - source_reference
+        - status
+        - final
+        - recipient_masked
+        - delivery_receipts_supported
+        - attempts
+        - created_at
+        - updated_at
+      properties:
+        id: {type: string, format: uuid}
+        idempotency_key: {$ref: '#/components/schemas/IdempotencyKeyValue'}
+        channel: {$ref: '#/components/schemas/Channel'}
+        purpose: {$ref: '#/components/schemas/Purpose'}
+        source_reference: {$ref: '#/components/schemas/SourceReference'}
+        status: {$ref: '#/components/schemas/MessageStatus'}
+        final:
+          type: boolean
+          description: True only for delivered, failed, expired.
+        failure_code:
+          $ref: '#/components/schemas/FailureCode'
+        provider_status:
+          type: string
+          maxLength: 64
+          description: Last raw provider status (e.g. `Delivered`, `Expired`, `http_503`, `tg_403`). Informational.
+        recipient_masked:
+          type: string
+          description: e.g. `+2519******01` or `chat:*******89`.
+        delivery_receipts_supported:
+          type: boolean
+          description: Fixed per channel — true for SMS (8028), false for Telegram.
+        attempts: {type: integer, minimum: 0}
+        created_at: {$ref: '#/components/schemas/Timestamp'}
+        updated_at: {$ref: '#/components/schemas/Timestamp'}
+        expires_at: {$ref: '#/components/schemas/Timestamp'}
+        sent_at: {$ref: '#/components/schemas/Timestamp'}
+        delivered_at: {$ref: '#/components/schemas/Timestamp'}
+      allOf:
+        - if:
+            properties:
+              channel: {const: telegram}
+            required: [channel]
+          then:
+            properties:
+              delivery_receipts_supported: {const: false}
+              status:
+                not: {const: delivered}
+            not:
+              required: [delivered_at]
+        - if:
+            properties:
+              channel: {const: sms}
+            required: [channel]
+          then:
+            properties:
+              delivery_receipts_supported: {const: true}
+        - if:
+            properties:
+              status: {const: delivered}
+            required: [status]
+          then:
+            required: [delivered_at]
+        - if:
+            properties:
+              status: {const: failed}
+            required: [status]
+          then:
+            required: [failure_code]
+    ErrorItem:
+      type: object
+      additionalProperties: false
+      required: [code]
+      properties:
+        field: {type: string}
+        code: {type: string}
+    Problem:
+      type: object
+      additionalProperties: false
+      required: [title, status, code]
+      properties:
+        type: {type: string, default: about:blank}
+        title: {type: string}
+        status: {type: integer}
+        code:
+          type: string
+          enum:
+            - unauthenticated
+            - forbidden
+            - not_found
+            - validation_failed
+            - idempotency_conflict
+            - payload_too_large
+            - unsupported_media_type
+            - service_unavailable
+        errors:
+          type: array
+          items: {$ref: '#/components/schemas/ErrorItem'}
+tags:
+  - name: messages

@@ -1,0 +1,15 @@
+{
+  "description": "422: redacted validation error (no submitted values echoed).",
+  "schema": "Problem",
+  "body": {
+    "title": "Validation failed",
+    "status": 422,
+    "code": "validation_failed",
+    "errors": [
+      {
+        "field": "text",
+        "code": "too_long_for_single_sms"
+      }
+    ]
+  }
+}

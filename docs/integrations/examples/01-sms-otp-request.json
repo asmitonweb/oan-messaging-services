@@ -1,0 +1,20 @@
+{
+  "description": "eSignet OTP delivery (purpose otp: expires_at required, <= 30 min ahead). Expected 202 on first acceptance, 200 with the same id on identical replay.",
+  "request": {
+    "method": "POST",
+    "path": "/api/v1/messages/sms"
+  },
+  "headers": {
+    "Content-Type": "application/json",
+    "Idempotency-Key": "6f1d2c3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f"
+  },
+  "schema": "SmsSubmission",
+  "expect_status": 202,
+  "body": {
+    "recipient": "+251900000001",
+    "text": "Your OAN code is 482913. It expires in 5 minutes.",
+    "source_reference": "esignet:otp:tx-7f3c9a",
+    "purpose": "otp",
+    "expires_at": "2026-09-01T05:17:13Z"
+  }
+}

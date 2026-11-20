@@ -1,0 +1,19 @@
+%% What an OAN message status means (contract 3.0.0)
+stateDiagram-v2
+  direction LR
+  [*] --> accepted: 202 / 200 replay
+  accepted --> sending: worker picks it up
+  accepted --> expired: deadline passed before sending
+  sending --> sent: provider accepted it
+  sending --> failed: provider definitely refused
+  sending --> unknown: outcome uncertain
+  sent --> delivered: 8028 receipt (SMS only)
+  sent --> failed: 8028 receipt says failed
+  delivered --> [*]
+  failed --> [*]
+  expired --> [*]
+  unknown --> [*]: never resent, never resubmit
+  note right of sent
+    Telegram stops here:
+    sent is its best outcome
+  end note

@@ -1,0 +1,52 @@
+# TEMPLATE CHECK ONLY. Enables every workload so the templates can be rendered and
+# inspected. Commands are the MSG-08 runtime entrypoints (oan_messaging.runtime).
+image:
+  repository: registry.example.invalid/oan/oan-messaging
+  digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+config:
+  policy: {dedupWindow: 2592000, workerLease: 120, purgeSweepInterval: 300}
+worker:
+  enabled: true
+  command: [python, -m, oan_messaging.runtime, worker]
+  channels: [sms, telegram]
+receipts:
+  enabled: true
+  command: [python, -m, oan_messaging.runtime, receipts]
+  service:
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: external
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+      service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    loadBalancerSourceRanges: [203.0.113.10/32]       # TEST-NET-3 placeholder
+cleanup:
+  enabled: true
+  mode: cronjob
+  command: [python, -m, oan_messaging.runtime, cleanup]
+secrets:
+  sms8028: {caKey: ca.crt}
+  telegram:
+    existingSecret: oan-messaging-telegram
+    bots: {grievance: grievance-bot-token}
+  receipts:
+    pinnedCertKeys: [current.pem, previous.pem]
+networkPolicy:
+  api:
+    from:
+      - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: apisix}}
+  receipts:
+    fromCIDRs: [203.0.113.10/32]
+  egress:
+    enabled: true
+    postgres: {cidrs: [10.0.20.0/24]}
+    sms8028: {cidrs: [203.0.113.20/32]}
+    telegram: {cidrs: [149.154.160.0/20, 91.108.4.0/22]}
+database:
+  migration: {existingSecret: oan-messaging-database-owner, urlKey: url}
+  connectionBudget: 140   # rollout estimate 133, steady 54 (see ci/regression)
+api:
+  ingress:
+    enabled: true
+    className: nginx
+    tlsSecretName: oan-messaging-api-tls
+migration:
+  network: {mode: hook}

@@ -1,0 +1,20 @@
+%% Ask a Development Agent, with RapidPro flows and the handover service (Telegram only, no SMS)
+sequenceDiagram
+  autonumber
+  actor F as Farmer
+  participant RP as RapidPro flow
+  participant HO as Handover service
+  participant DAB as DA backend roster
+  actor DA as Development Agent
+  F->>RP: Ask a DA: topic, photos / voice, Send
+  RP->>HO: webhook: create question (contact uuid, kebele, topic, media ids)
+  HO->>DAB: roster for kebele (mode, specialism, on leave)
+  HO->>HO: pick DA (round robin) or kebele inbox, store question
+  HO->>RP: send to DA's Telegram (header + media) via RapidPro API
+  HO-->>RP: question number
+  RP-->>F: "Your question Q-123 reached your DA"
+  DA->>RP: reply (text / voice / photo) to the bot
+  RP->>HO: webhook: DA message (match to open question)
+  HO->>RP: relay to farmer with Q-123
+  RP-->>F: DA's answer
+  Note over HO,DA: alerts and reminders to Development Agents are Telegram messages only, no SMS

@@ -1,0 +1,12 @@
+%% Design 1: securing the Telegram webhook in front of RapidPro courier
+flowchart TB
+  T["Telegram"] -->|"HTTPS 443<br/>X-Telegram-Bot-Api-Secret-Token"| LB["Load balancer<br/>Telegram IP ranges only"]
+  LB --> GW{"APISIX route<br/>POST /c/tg/&lt;uuid&gt;/receive only"}
+  GW -->|"secret matches<br/>(constant-time)"| C["courier"]
+  GW -->|"anything else"| X["404 / 401<br/>counted + alerted"]
+  C -->|"dedupe by message id"| M["mailroom"]
+  subgraph PRIV["Private (no external route)"]
+    M
+    W["RapidPro web UI / API<br/>staff via VPN + SSO"]
+    DB[("Postgres, Redis,<br/>storage (encrypted)")]
+  end

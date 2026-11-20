@@ -1,0 +1,1544 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OAN Messaging <messaging@example.invalid>
+Date: Tue, 17 Nov 2026 08:45:18 +0530
+Subject: [PATCH] feat(otp): deliver consent OTPs by SMS through the OAN
+ Messaging Service
+
+When CONSENT_MANAGER_OAN_DELIVERY_ENABLED is on with a base URL and token, both OTP
+providers send each issued code as one SMS (purpose otp, expiring with the code) and
+report delivers = true, so OtpService no longer needs the log or bucket harness. A code
+that cannot be handed to OAN raises OtpError, so the request is refused visibly (422 no
+phone, 502 refused, 503 unavailable, 500 misconfigured) instead of waiting on a code
+nobody received. The code and phone are never logged.
+
+- services/otp_delivery.py: phone resolution (test map; a registry resolver plugs in at
+  resolve_phone), text that always fits one SMS part, one idempotency key per code.
+- oan_client/: the OAN Messaging client (contract 3.0.0), vendored unchanged apart from
+  relative imports.
+- otp_service.py, otp_consent_service.py: a send whose outcome is uncertain still counts
+  against the resend cooldown and the send budgets (a resend keeps the new code).
+- tests: 14 unit tests and 7 integration tests through the partner portal API.
+---
+ backend/src/openg2p_consent_manager/config.py |  38 +-
+ .../oan_client/VENDORED.md                    |   3 +
+ .../oan_client/__init__.py                    |  48 ++
+ .../oan_client/client.py                      | 633 ++++++++++++++++++
+ .../oan_client/keys.py                        |  64 ++
+ .../services/otp_consent_service.py           |   5 +-
+ .../services/otp_delivery.py                  | 158 +++++
+ .../services/otp_provider.py                  |  42 +-
+ .../services/otp_service.py                   |  16 +-
+ .../services/sms_length.py                    |  17 +
+ backend/tests/test_oan_otp_delivery.py        | 168 +++++
+ backend/tests/test_otp_sms.py                 | 154 +++++
+ 12 files changed, 1333 insertions(+), 13 deletions(-)
+ create mode 100644 backend/src/openg2p_consent_manager/oan_client/VENDORED.md
+ create mode 100644 backend/src/openg2p_consent_manager/oan_client/__init__.py
+ create mode 100644 backend/src/openg2p_consent_manager/oan_client/client.py
+ create mode 100644 backend/src/openg2p_consent_manager/oan_client/keys.py
+ create mode 100644 backend/src/openg2p_consent_manager/services/otp_delivery.py
+ create mode 100644 backend/src/openg2p_consent_manager/services/sms_length.py
+ create mode 100644 backend/tests/test_oan_otp_delivery.py
+ create mode 100644 backend/tests/test_otp_sms.py
+
+diff --git a/backend/src/openg2p_consent_manager/config.py b/backend/src/openg2p_consent_manager/config.py
+index 7db9e8b..3dcfdf2 100644
+--- a/backend/src/openg2p_consent_manager/config.py
++++ b/backend/src/openg2p_consent_manager/config.py
+@@ -253,7 +253,7 @@ class Settings(BaseSettings):
+ 
+     # ── OTP consent: partner raises a request, the CM sends the subject a code,
+     # the partner submits it and the consent is granted (partner portal API) ──
+-    otp_provider: str = "fayda"  # fayda | internal (neither delivers the code yet)
++    otp_provider: str = "fayda"  # fayda | internal (delivered by SMS when oan_delivery_enabled)
+     otp_length: int = 6
+     otp_ttl_sec: int = 300
+     otp_max_attempts: int = 3  # wrong codes per issued code
+@@ -287,6 +287,42 @@ class Settings(BaseSettings):
+     otp_publish_secret_key: str = ""
+     otp_publish_id_type: str = "FIN"
+ 
++    # ── OTP delivery by SMS through the OAN Messaging Service ───────────────
++    # Off by default. When on (with a base URL and token), every issued code is
++    # sent as one SMS (purpose "otp", expiring with the code itself), and an
++    # issue that cannot be delivered fails visibly instead of storing the code.
++    oan_delivery_enabled: bool = False
++    oan_base_url: str = ""  # e.g. https://oan-messaging.<env>  (no path)
++    oan_token: str = ""  # caller credential from the OAN operator; secret
++    oan_ca_bundle: str = ""  # optional CA bundle path for the OAN API
++    oan_timeout_seconds: float = 5.0
++    oan_max_attempts: int = 2  # client retries, same key and body
++    # Subject -> phone resolution. "map" reads oan_otp_phone_map (dev/staging test
++    # numbers only). A production resolver (the registered phone from the
++    # beneficiary API, approved by the identity owner) replaces it; see
++    # services/otp_delivery.py.
++    oan_phone_resolver: str = "map"
++    # JSON: {"<subject_id_value>": "0900000101"}
++    oan_otp_phone_map: str = ""
++
++    @property
++    def oan_otp_phones(self) -> dict:
++        import json
++
++        raw = (self.oan_otp_phone_map or "").strip()
++        if not raw:
++            return {}
++        try:
++            parsed = json.loads(raw)
++        except ValueError:  # never log the value: it holds phones
++            return {}
++        return parsed if isinstance(parsed, dict) else {}
++
++    @property
++    def oan_delivery_ready(self) -> bool:
++        """SMS delivery is switched on and has somewhere to send."""
++        return bool(self.oan_delivery_enabled and self.oan_base_url and self.oan_token)
++
+     # ── Subject authentication with national ID (consent scenario 1, phase 2) ──
+     # The subject (e.g. a farmer at the bank) proves who they are through an
+     # OIDC provider such as eSignet (OTP, biometrics) during an assisted request:
+diff --git a/backend/src/openg2p_consent_manager/oan_client/VENDORED.md b/backend/src/openg2p_consent_manager/oan_client/VENDORED.md
+new file mode 100644
+index 0000000..be8a09e
+--- /dev/null
++++ b/backend/src/openg2p_consent_manager/oan_client/VENDORED.md
+@@ -0,0 +1,3 @@
++Vendored copy of the OAN Messaging client (`examples/oan_client` in the OAN messaging
++repository, contract 3.0.0). Only the package imports were made relative. Do not edit
++here; update by copying a newer release.
+diff --git a/backend/src/openg2p_consent_manager/oan_client/__init__.py b/backend/src/openg2p_consent_manager/oan_client/__init__.py
+new file mode 100644
+index 0000000..36364b9
+--- /dev/null
++++ b/backend/src/openg2p_consent_manager/oan_client/__init__.py
+@@ -0,0 +1,48 @@
++"""OAN Messaging Service client and integration helpers (contract 3.0.0).
++
++INTEGRATION-READY EXAMPLE CODE, NOT AN INSTALLED INTEGRATION.
++"""
++
++from .client import (
++    CONTRACT_VERSION,
++    STATUS_MEANINGS,
++    ClientConfig,
++    Delivery,
++    MessageStatus,
++    OanClient,
++    OanClientError,
++    OanConflict,
++    OanProtocolError,
++    OanRejected,
++    OanRetryDeferred,
++    OanUncertain,
++    ReconciliationRequired,
++    Secret,
++    SmsDelivery,
++    Submission,
++    TelegramDelivery,
++)
++from .keys import KEY_ALGORITHM, delivery_key, key_material
++
++__all__ = [
++    "CONTRACT_VERSION",
++    "KEY_ALGORITHM",
++    "STATUS_MEANINGS",
++    "ClientConfig",
++    "Delivery",
++    "MessageStatus",
++    "OanClient",
++    "OanClientError",
++    "OanConflict",
++    "OanProtocolError",
++    "OanRejected",
++    "OanRetryDeferred",
++    "OanUncertain",
++    "ReconciliationRequired",
++    "Secret",
++    "SmsDelivery",
++    "Submission",
++    "TelegramDelivery",
++    "delivery_key",
++    "key_material",
++]
+diff --git a/backend/src/openg2p_consent_manager/oan_client/client.py b/backend/src/openg2p_consent_manager/oan_client/client.py
+new file mode 100644
+index 0000000..bad0502
+--- /dev/null
++++ b/backend/src/openg2p_consent_manager/oan_client/client.py
+@@ -0,0 +1,633 @@
++"""Reusable async client for the OAN Messaging Service API (contract 3.0.0).
++
++INTEGRATION-READY EXAMPLE CODE, NOT AN INSTALLED INTEGRATION. Copy it into a calling
++service (or vendor it) and wire it to that service's own configuration and outbox.
++
++What it guarantees:
++
++* Calls only the accepted endpoints: ``POST /api/v1/messages/sms``,
++  ``POST /api/v1/messages/telegram`` and ``GET /api/v1/messages/{id}``.
++* Every submission carries a caller-chosen ``Idempotency-Key``, kept separate from
++  ``source_reference``. The request body is serialized **once**, and every retry resends
++  the identical bytes with the identical key: same text, recipient, purpose and expiry.
++* Retries only uncertain outcomes (timeouts, dropped connections, 5xx, API rate limiting)
++  with bounded attempts and backoff. Never retries validation, authorization or
++  conflicting-content errors.
++* Never retries earlier than a server ``Retry-After``. If the server asks for a longer wait
++  than the local wait budget, the call stops with ``OanRetryDeferred`` carrying
++  ``retry_not_before``; the caller schedules the same stored delivery no earlier. Delays
++  above 10 years are clamped (``MAX_RETRY_AFTER_SECONDS``); for submissions that always
++  means ``ReconciliationRequired``.
++* Never changes ``expires_at`` and never builds a replacement message or a new key.
++* After the idempotency guarantee window it stops automatic retries
++  (``ReconciliationRequired``).
++* TLS is always verified (system CAs or a provided CA bundle). Redirects are never
++  followed. Timeouts are bounded. Environment proxies are ignored.
++* Logs and exception messages never contain message text, recipients, OTPs, chat IDs or
++  credentials. Error codes and field names from a response are reduced to the contract's
++  known value-free values; anything else becomes ``unrecognized``.
++
++Retrying the OAN API is different from resending to an SMS gateway. A retry here is a
++same-key replay: OAN returns the original message (HTTP 200) and sends nothing new.
++Delivery to the gateway is OAN's job. OAN never resends a message whose provider outcome
++is ``unknown``, and neither may the caller (no new key for the same intended delivery).
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++import math
++import random
++import re
++import ssl
++from collections.abc import Awaitable, Callable, Mapping
++from dataclasses import dataclass, field
++from datetime import UTC, datetime, timedelta
++from email.utils import parsedate_to_datetime
++from typing import Any
++from urllib.parse import urlsplit
++
++import httpx
++
++log = logging.getLogger("oan_client")
++
++CONTRACT_VERSION = "3.0.0"
++API_PREFIX = "/api/v1/messages"
++IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]{7,127}$")
++SOURCE_REFERENCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]{0,127}$")
++PURPOSES = frozenset({"otp", "transactional", "alert", "broadcast"})
++#: Uncertain HTTP statuses: the message may or may not be stored. Retry with same key.
++RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
++#: Contract default guarantee window for completed messages (ServicePolicy.dedup_window).
++DEFAULT_GUARANTEE_WINDOW = timedelta(days=30)
++
++
++# ------------------------------------------------------------------ configuration
++
++
++class Secret:
++    """Opaque credential holder; never rendered by repr/str."""
++
++    __slots__ = ("_value",)
++
++    def __init__(self, value: str) -> None:
++        if not value or value != value.strip():
++            raise ValueError("credential must be non-empty without surrounding space")
++        self._value = value
++
++    def reveal(self) -> str:
++        return self._value
++
++    def __repr__(self) -> str:
++        return "Secret(<redacted>)"
++
++    __str__ = __repr__
++
++
++@dataclass(frozen=True)
++class ClientConfig:
++    """Caller-supplied configuration. Load ``token`` from the caller's secret store."""
++
++    base_url: str  #: e.g. the future dev URL; see docs/integrations (placeholder only)
++    token: Secret  #: service credential issued to THIS calling service by OAN operators
++    connect_timeout: float = 5.0
++    read_timeout: float = 10.0
++    #: Total attempts per call (first try + retries) for uncertain outcomes.
++    max_attempts: int = 4
++    backoff_base: float = 0.5
++    backoff_cap: float = 8.0
++    #: Local wait budget (seconds): the longest server ``Retry-After`` this client waits
++    #: out in-process. A longer delay is not waited out or cut to the budget; the call
++    #: stops with ``OanRetryDeferred`` and the caller retries no earlier than
++    #: ``retry_not_before`` (see ``MAX_RETRY_AFTER_SECONDS`` for the one exception).
++    max_retry_after: float = 30.0
++    guarantee_window: timedelta = DEFAULT_GUARANTEE_WINDOW
++    #: Optional CA bundle path for a private CA; verification can never be disabled.
++    ca_bundle: str | None = None
++
++    def __post_init__(self) -> None:
++        parts = urlsplit(self.base_url)
++        if parts.scheme != "https" or not parts.hostname:
++            raise ValueError("base_url must be an https URL")
++        if parts.query or parts.fragment or parts.username or parts.password:
++            raise ValueError("base_url must not contain query, fragment or credentials")
++        if not (0 < self.connect_timeout <= 60 and 0 < self.read_timeout <= 120):
++            raise ValueError("timeouts must be positive and bounded")
++        if not 1 <= self.max_attempts <= 10:
++            raise ValueError("max_attempts must be between 1 and 10")
++        if self.backoff_base <= 0 or self.backoff_cap < self.backoff_base:
++            raise ValueError("backoff must be positive")
++        if not (0 < self.max_retry_after <= 3600) or self.guarantee_window <= timedelta(0):
++            raise ValueError("max_retry_after must be in (0, 3600]; guarantee_window positive")
++
++    def __repr__(self) -> str:
++        return f"ClientConfig(base_url={self.base_url!r}, token=<redacted>)"
++
++
++# ---------------------------------------------------------------------- deliveries
++
++
++def _check_common(key: str, source_reference: str, purpose: str,
++                  expires_at: datetime | None, first_submitted_at: datetime) -> None:
++    if not IDEMPOTENCY_KEY_RE.fullmatch(key):
++        raise ValueError("idempotency_key must be 8-128 chars of [A-Za-z0-9._:-]")
++    if not SOURCE_REFERENCE_RE.fullmatch(source_reference):
++        raise ValueError("source_reference has an invalid format")
++    if purpose not in PURPOSES:
++        raise ValueError("purpose must be otp, transactional, alert or broadcast")
++    if expires_at is not None and expires_at.utcoffset() is None:
++        raise ValueError("expires_at must be timezone-aware")
++    if purpose == "otp" and expires_at is None:
++        raise ValueError("expires_at is required for otp")
++    if first_submitted_at.utcoffset() is None:
++        raise ValueError("first_submitted_at must be timezone-aware")
++
++
++@dataclass(frozen=True, repr=False)
++class SmsDelivery:
++    """One intended SMS delivery. Persist it (e.g. in an outbox) before the first attempt
++    and reuse the SAME object for every retry, including after a process restart."""
++
++    idempotency_key: str
++    recipient: str
++    text: str
++    source_reference: str
++    purpose: str
++    expires_at: datetime | None
++    #: When this delivery was first attempted; drives the guarantee window.
++    first_submitted_at: datetime
++
++    def __post_init__(self) -> None:
++        _check_common(self.idempotency_key, self.source_reference, self.purpose,
++                      self.expires_at, self.first_submitted_at)
++
++    def body(self) -> dict[str, Any]:
++        out: dict[str, Any] = {"recipient": self.recipient, "text": self.text,
++                               "source_reference": self.source_reference,
++                               "purpose": self.purpose}
++        if self.expires_at is not None:
++            out["expires_at"] = self.expires_at.isoformat()  # exactly as supplied
++        return out
++
++    def __repr__(self) -> str:
++        return (f"SmsDelivery(key=…{self.idempotency_key[-4:]}, "
++                f"source_reference={self.source_reference!r}, purpose={self.purpose!r})")
++
++
++@dataclass(frozen=True, repr=False)
++class TelegramDelivery:
++    """One intended Telegram delivery to an already-known chat. The bot is chosen by OAN
++    from the caller's authorized configuration; the request cannot name one."""
++
++    idempotency_key: str
++    chat_id: int
++    text: str
++    source_reference: str
++    purpose: str
++    expires_at: datetime | None
++    first_submitted_at: datetime
++
++    def __post_init__(self) -> None:
++        _check_common(self.idempotency_key, self.source_reference, self.purpose,
++                      self.expires_at, self.first_submitted_at)
++        if isinstance(self.chat_id, bool) or not isinstance(self.chat_id, int):
++            raise ValueError("chat_id must be an integer")
++
++    def body(self) -> dict[str, Any]:
++        out: dict[str, Any] = {"chat_id": self.chat_id, "text": self.text,
++                               "source_reference": self.source_reference,
++                               "purpose": self.purpose}
++        if self.expires_at is not None:
++            out["expires_at"] = self.expires_at.isoformat()
++        return out
++
++    def __repr__(self) -> str:
++        return (f"TelegramDelivery(key=…{self.idempotency_key[-4:]}, "
++                f"source_reference={self.source_reference!r}, purpose={self.purpose!r})")
++
++
++Delivery = SmsDelivery | TelegramDelivery
++
++
++# ------------------------------------------------------------------------ results
++
++
++@dataclass(frozen=True)
++class Submission:
++    """Result of a submission: 202 (``replayed=False``) or identical replay 200
++    (``replayed=True``). ``status`` is OAN's current status, never a delivery claim
++    unless it says ``delivered``."""
++
++    id: str
++    idempotency_key: str
++    channel: str
++    status: str
++    source_reference: str
++    created_at: str
++    expires_at: str | None
++    replayed: bool
++
++
++STATUS_MEANINGS: Mapping[str, str] = {
++    "accepted": "Stored by OAN. Nothing has been handed to a provider yet.",
++    "sending": "OAN has started a provider call. Wait; do not resubmit.",
++    "sent": ("The provider accepted the message (8028 queued it / Telegram accepted it). "
++             "This is NOT handset delivery."),
++    "delivered": "8028 reported handset delivery (SMS only; Telegram never reports this).",
++    "failed": "Definite non-delivery as reported; see failure_code. Not retried by OAN.",
++    "expired": "expires_at passed before any provider submission; it never left OAN.",
++    "unknown": ("A provider submission was attempted but its outcome cannot be proven. "
++                "OAN will not resend it. Do NOT submit again or use a new key for this "
++                "delivery; reconcile operationally instead."),
++}
++
++
++@dataclass(frozen=True)
++class MessageStatus:
++    id: str
++    idempotency_key: str
++    channel: str
++    purpose: str
++    source_reference: str
++    status: str
++    final: bool
++    delivery_receipts_supported: bool
++    attempts: int
++    failure_code: str | None
++    provider_status: str | None
++    recipient_masked: str
++    raw: Mapping[str, Any] = field(repr=False)
++
++    @property
++    def meaning(self) -> str:
++        text = STATUS_MEANINGS.get(self.status, "Unrecognized status; treat as unknown.")
++        if self.status == "sent" and not self.delivery_receipts_supported:
++            text += " Telegram has no delivery receipts: 'sent' is the strongest outcome."
++        return text
++
++    @property
++    def may_resubmit(self) -> bool:
++        """Always False. A same-key replay never creates a new message, and a new key for
++        the same intended delivery would risk a duplicate. A new delivery decided by the
++        originating service's own business rules (e.g. a user-requested OTP resend) is a
++        different delivery with its own key, not a resubmission."""
++        return False
++
++
++# ------------------------------------------------------------------------- errors
++
++
++class OanClientError(Exception):
++    """Base class. Messages never include bodies, recipients, OTPs or credentials."""
++
++
++class OanRejected(OanClientError):
++    """A definite rejection (validation, authentication, permission, conflict, not found).
++    Never retried automatically: fix the request or configuration."""
++
++    def __init__(self, status: int, code: str, errors: tuple[tuple[str | None, str], ...]):
++        self.status, self.code, self.errors = status, code, errors
++        fields = ", ".join(f"{f or '-'}:{c}" for f, c in errors) or "-"
++        super().__init__(f"OAN rejected the request: HTTP {status} {code} [{fields}]")
++
++
++class OanConflict(OanRejected):
++    """409: this Idempotency-Key is bound to a different body. Do not change the key or
++    the body to 'fix' it: find out why the same delivery produced different content."""
++
++
++class OanUncertain(OanClientError):
++    """Retries exhausted on uncertain outcomes. The message MAY already be stored. Retry
++    later with the SAME delivery (same key and body), within the guarantee window, and
++    not before ``retry_not_before`` when the server gave one (``Retry-After``).
++
++    For ``get_status`` the ``idempotency_key`` attribute holds the message id."""
++
++    def __init__(self, key: str, attempts: int, last: str,
++                 retry_not_before: datetime | None = None) -> None:
++        self.idempotency_key, self.attempts, self.last = key, attempts, last
++        self.retry_not_before = retry_not_before
++        when = f"not before {retry_not_before.isoformat()} " if retry_not_before else ""
++        super().__init__(f"outcome uncertain after {attempts} attempts (last: {last}); "
++                         f"retry later {when}with the same key …{key[-4:]}")
++
++
++class OanRetryDeferred(OanUncertain):
++    """The server asked for a ``Retry-After`` longer than the local wait budget. Nothing
++    was retried early. Keep the stored delivery unchanged (key, body, ``expires_at``,
++    ``first_submitted_at``) and retry it no earlier than ``retry_not_before``."""
++
++    def __init__(self, key: str, attempts: int, last: str,
++                 retry_not_before: datetime) -> None:
++        super().__init__(key, attempts, last, retry_not_before)
++
++
++class ReconciliationRequired(OanClientError):
++    """The guarantee window has passed, or the server's ``Retry-After`` ends at or after
++    it: automatic submission retries stop. A completed message's binding may have been
++    released, so a retry could create a NEW message. Reconcile with the message id (GET),
++    or ask OAN operators to look the delivery up by caller and Idempotency-Key. There is
++    no lookup-by-key API endpoint."""
++
++    def __init__(self, key: str, retry_not_before: datetime | None = None) -> None:
++        self.idempotency_key = key
++        self.retry_not_before = retry_not_before
++        super().__init__(f"idempotency guarantee window passed for key …{key[-4:]}; "
++                         "stop retrying and reconcile")
++
++
++class OanProtocolError(OanClientError):
++    """Unexpected response shape or a redirect (redirects are never followed)."""
++
++
++# ------------------------------------------------------------------------- client
++
++
++#: Problem ``code`` values defined by contract 3.0.0 (``Problem.code``).
++PROBLEM_CODES = frozenset({
++    "unauthenticated", "forbidden", "not_found", "validation_failed",
++    "idempotency_conflict", "payload_too_large", "unsupported_media_type",
++    "service_unavailable",
++})
++#: ``ErrorItem.field`` locations the accepted API reports. Anything else becomes ``None``.
++ERROR_FIELDS = frozenset({
++    "recipient", "chat_id", "text", "source_reference", "purpose", "expires_at",
++    "header.Idempotency-Key",
++})
++#: Value-free ``ErrorItem.code`` values the accepted API emits (oan_messaging.api and
++#: storage expiry codes, plus the pydantic error types it passes through for these
++#: fields). Anything else becomes ``unrecognized``.
++ERROR_CODES = frozenset({
++    # api/app.py and api/problems.py
++    "method_not_allowed", "invalid_request", "outcome_uncertain_retry_same_key",
++    "channel_not_permitted", "required", "invalid_format", "invalid_json",
++    "purpose_not_permitted", "telegram_bot_not_configured", "payload_mismatch",
++    "invalid_et_mobile", "too_long_for_single_sms", "too_long", "blank",
++    "control_characters", "invalid_chat_id", "required_for_otp", "invalid",
++    "unknown_field", "timezone_required",
++    # storage expiry checks
++    "not_in_future", "beyond_ceiling",
++    # pydantic error types passed through unchanged
++    "string_type", "string_too_short", "string_too_long", "int_type", "int_parsing",
++    "int_from_float", "literal_error", "enum", "datetime_type", "datetime_parsing",
++    "datetime_from_date_parsing", "model_type", "model_attributes_type", "dict_type",
++    "json_invalid", "json_type",
++})
++UNRECOGNIZED = "unrecognized"
++UNPARSEABLE = "unparseable_error"
++#: At most this many error items are kept from one response.
++MAX_ERROR_ITEMS = 16
++#: Error bodies larger than this are not parsed at all.
++MAX_ERROR_BODY_BYTES = 16 * 1024
++#: Retry-After values above this (10 years) are CLAMPED to it, so date arithmetic stays
++#: finite and storable. This is technically a shortening, and the only one:
++#:
++#: * submissions: 10 years is far beyond the 30-day guarantee window, so the call raises
++#:   ``ReconciliationRequired`` and nothing is retried automatically;
++#: * status reads: ``retry_not_before`` becomes ~10 years ahead, which in practice stops
++#:   automatic polling for that message (operators reconcile it). A read cannot cause a
++#:   duplicate send, so the clamp cannot affect delivery safety.
++#:
++#: A date that cannot be represented at all becomes ``datetime.max`` (UTC).
++MAX_RETRY_AFTER_SECONDS = 10 * 365 * 86400.0
++_DIGITS = re.compile(r"[0-9]{1,12}")
++
++
++ErrorItems = tuple[tuple[str | None, str], ...]
++
++
++def _parse_problem(resp: httpx.Response) -> tuple[str, ErrorItems]:
++    """Reduce an error body to contract-known, value-free codes. Never returns a string
++    taken from the response unless it is in the allow-lists above, so an echoed OTP,
++    phone number, message text or token can never reach an exception or a log."""
++    if len(resp.content) > MAX_ERROR_BODY_BYTES:
++        return UNPARSEABLE, ()
++    try:
++        data = json.loads(resp.content)
++    except (ValueError, RecursionError):  # includes JSONDecodeError and UnicodeDecodeError
++        return UNPARSEABLE, ()
++    if not isinstance(data, dict):
++        return UNPARSEABLE, ()
++    raw_code = data.get("code")
++    code = raw_code if isinstance(raw_code, str) and raw_code in PROBLEM_CODES else UNRECOGNIZED
++    raw_errors = data.get("errors")
++    items: list[tuple[str | None, str]] = []
++    if isinstance(raw_errors, list):
++        for e in raw_errors[:MAX_ERROR_ITEMS]:
++            if isinstance(e, dict):
++                f, c = e.get("field"), e.get("code")
++                item = (f if isinstance(f, str) and f in ERROR_FIELDS else None,
++                        c if isinstance(c, str) and c in ERROR_CODES else UNRECOGNIZED)
++            else:
++                item = (None, UNRECOGNIZED)
++            if item not in items:
++                items.append(item)
++    elif raw_errors is not None:
++        items.append((None, UNRECOGNIZED))  # wrong shape: report it, never its content
++    return code, tuple(items)
++
++
++def _retry_after(resp: httpx.Response, now: datetime) -> float | None:
++    """Seconds to wait from ``Retry-After`` (delta-seconds or HTTP-date), or ``None`` if
++    absent or malformed. Never negative; clamped to ``MAX_RETRY_AFTER_SECONDS``."""
++    raw = resp.headers.get("retry-after")
++    if raw is None:
++        return None
++    raw = raw.strip()
++    if raw.isascii() and raw.isdigit():
++        if not _DIGITS.fullmatch(raw):
++            return MAX_RETRY_AFTER_SECONDS  # absurdly long: clamped (see constant)
++        return min(float(int(raw)), MAX_RETRY_AFTER_SECONDS)
++    if len(raw) > 64:
++        return None
++    try:
++        when = parsedate_to_datetime(raw)
++    except (TypeError, ValueError, IndexError, OverflowError):
++        return None
++    if when.tzinfo is None:
++        return None
++    seconds = (when - now).total_seconds()
++    if not math.isfinite(seconds):
++        return None
++    return min(max(seconds, 0.0), MAX_RETRY_AFTER_SECONDS)
++
++
++def _opt_str(value: object) -> str | None:
++    return None if value is None else str(value)
++
++
++def _not_before(now: datetime, seconds: float) -> datetime:
++    try:
++        return now + timedelta(seconds=seconds)
++    except OverflowError:
++        return datetime.max.replace(tzinfo=UTC)
++
++
++class OanClient:
++    """Async client. Use as ``async with OanClient(config) as client: ...``."""
++
++    def __init__(
++        self,
++        config: ClientConfig,
++        *,
++        transport: httpx.AsyncBaseTransport | None = None,
++        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
++        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
++        jitter: Callable[[float, float], float] = random.uniform,
++    ) -> None:
++        self._cfg = config
++        self._clock = clock
++        self._sleep = sleep
++        self._jitter = jitter
++        verify: ssl.SSLContext | bool = (
++            ssl.create_default_context(cafile=config.ca_bundle) if config.ca_bundle else True)
++        self._http = httpx.AsyncClient(
++            base_url=config.base_url.rstrip("/"),
++            timeout=httpx.Timeout(config.read_timeout, connect=config.connect_timeout),
++            verify=verify,
++            follow_redirects=False,
++            trust_env=False,
++            transport=transport,
++            headers={"Authorization": f"Bearer {config.token.reveal()}",
++                     "Accept": "application/json"},
++        )
++
++    async def __aenter__(self) -> OanClient:
++        return self
++
++    async def __aexit__(self, *exc: object) -> None:
++        await self.aclose()
++
++    async def aclose(self) -> None:
++        await self._http.aclose()
++
++    def __repr__(self) -> str:
++        return f"OanClient({self._cfg!r})"
++
++    # ------------------------------------------------------------------ submit
++
++    async def submit(self, delivery: Delivery) -> Submission:
++        """Submit (or safely replay) one delivery. Returns on 202 or 200."""
++        channel = "sms" if isinstance(delivery, SmsDelivery) else "telegram"
++        body = json.dumps(delivery.body(), separators=(",", ":"),
++                          ensure_ascii=False).encode("utf-8")  # serialized ONCE
++        headers = {"Content-Type": "application/json",
++                   "Idempotency-Key": delivery.idempotency_key}
++        key = delivery.idempotency_key
++        deadline = delivery.first_submitted_at + self._cfg.guarantee_window
++        last = "none"
++        for attempt in range(1, self._cfg.max_attempts + 1):
++            if self._clock() >= deadline:
++                raise ReconciliationRequired(key)
++            try:
++                resp = await self._http.post(f"{API_PREFIX}/{channel}", content=body,
++                                             headers=headers, follow_redirects=False)
++            except httpx.TransportError as exc:  # includes timeouts and dropped connections
++                last = type(exc).__name__
++                self._log(channel, attempt, last, key)
++                await self._wait_or_raise(attempt, None, key, last, deadline)
++                continue
++            self._log(channel, attempt, str(resp.status_code), key)
++            if resp.status_code in (200, 202):
++                return self._submission(resp, replayed=resp.status_code == 200)
++            if resp.status_code in RETRYABLE_STATUSES:
++                last = f"http_{resp.status_code}"
++                await self._wait_or_raise(attempt, _retry_after(resp, self._clock()),
++                                          key, last, deadline)
++                continue
++            self._raise_for(resp)
++        raise OanUncertain(key, self._cfg.max_attempts, last)  # pragma: no cover
++
++    # ------------------------------------------------------------------ status
++
++    async def get_status(self, message_id: str) -> MessageStatus:
++        """``GET /api/v1/messages/{id}``. Read-only, so uncertain outcomes are retried
++        (bounded). Never triggers a submission."""
++        if not re.fullmatch(r"[0-9a-fA-F-]{36}", message_id):
++            raise ValueError("message_id must be a UUID")
++        last = "none"
++        for attempt in range(1, self._cfg.max_attempts + 1):
++            try:
++                resp = await self._http.get(f"{API_PREFIX}/{message_id}",
++                                            follow_redirects=False)
++            except httpx.TransportError as exc:
++                last = type(exc).__name__
++                await self._wait_or_raise(attempt, None, message_id, last, None)
++                continue
++            if resp.status_code == 200:
++                return self._status(resp)
++            if resp.status_code in RETRYABLE_STATUSES:
++                last = f"http_{resp.status_code}"
++                await self._wait_or_raise(attempt, _retry_after(resp, self._clock()),
++                                          message_id, last, None)
++                continue
++            self._raise_for(resp)
++        raise OanUncertain(message_id, self._cfg.max_attempts, last)  # pragma: no cover
++
++    # ------------------------------------------------------------------ helpers
++
++    async def _wait_or_raise(self, attempt: int, retry_after: float | None, key: str,
++                             last: str, deadline: datetime | None) -> None:
++        """Wait before the next attempt, or raise. Never waits less than ``Retry-After``:
++        a delay beyond the local budget raises ``OanRetryDeferred``, one ending at or after
++        the guarantee window raises ``ReconciliationRequired``, and the last attempt
++        raises ``OanUncertain`` (with ``retry_not_before`` when the server gave one)."""
++        if retry_after is not None:
++            not_before = _not_before(self._clock(), retry_after)
++            if deadline is not None and not_before >= deadline:
++                raise ReconciliationRequired(key, not_before)
++            if attempt >= self._cfg.max_attempts:
++                raise OanUncertain(key, attempt, last, not_before)
++            if retry_after > self._cfg.max_retry_after:
++                raise OanRetryDeferred(key, attempt, last, not_before)
++            await self._sleep(retry_after)
++            return
++        if attempt >= self._cfg.max_attempts:
++            raise OanUncertain(key, attempt, last)
++        ceiling = min(self._cfg.backoff_cap, self._cfg.backoff_base * 2 ** (attempt - 1))
++        await self._sleep(self._jitter(0.0, ceiling))
++
++    def _raise_for(self, resp: httpx.Response) -> None:
++        if 300 <= resp.status_code < 400:
++            raise OanProtocolError(f"unexpected redirect (HTTP {resp.status_code}); "
++                                   "redirects are never followed")
++        code, errors = _parse_problem(resp)
++        if resp.status_code == 409:
++            raise OanConflict(409, code, errors)
++        if 400 <= resp.status_code < 500:
++            raise OanRejected(resp.status_code, code, errors)
++        raise OanProtocolError(f"unexpected HTTP status {resp.status_code}")
++
++    def _submission(self, resp: httpx.Response, *, replayed: bool) -> Submission:
++        try:
++            d = resp.json()
++            return Submission(id=str(d["id"]), idempotency_key=str(d["idempotency_key"]),
++                              channel=str(d["channel"]), status=str(d["status"]),
++                              source_reference=str(d["source_reference"]),
++                              created_at=str(d["created_at"]),
++                              expires_at=_opt_str(d.get("expires_at")), replayed=replayed)
++        except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
++            raise OanProtocolError("unexpected submission response shape") from None
++
++    def _status(self, resp: httpx.Response) -> MessageStatus:
++        try:
++            d = resp.json()
++            return MessageStatus(
++                id=str(d["id"]), idempotency_key=str(d["idempotency_key"]),
++                channel=str(d["channel"]), purpose=str(d["purpose"]),
++                source_reference=str(d["source_reference"]), status=str(d["status"]),
++                final=bool(d["final"]),
++                delivery_receipts_supported=bool(d["delivery_receipts_supported"]),
++                attempts=int(d["attempts"]), failure_code=_opt_str(d.get("failure_code")),
++                provider_status=_opt_str(d.get("provider_status")),
++                recipient_masked=str(d["recipient_masked"]), raw=d)
++        except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
++            raise OanProtocolError("unexpected status response shape") from None
++
++    @staticmethod
++    def _log(channel: str, attempt: int, outcome: str, key: str) -> None:
++        # Never the body, recipient, OTP, chat id or token; key shortened to 4 chars.
++        log.info("oan submit channel=%s attempt=%s outcome=%s key=…%s",
++                 channel, attempt, outcome, key[-4:])
+diff --git a/backend/src/openg2p_consent_manager/oan_client/keys.py b/backend/src/openg2p_consent_manager/oan_client/keys.py
+new file mode 100644
+index 0000000..a0f94df
+--- /dev/null
++++ b/backend/src/openg2p_consent_manager/oan_client/keys.py
+@@ -0,0 +1,64 @@
++"""Stable, opaque per-delivery Idempotency-Keys.
++
++Preferred: generate a random UUID4 when a delivery is first recorded in the caller's
++outbox and store it with that row, so every retry and restart reuses it. A stored UUID4
++is also the only safe choice when the caller's own ids can be reused (for example a
++Frappe naming series that restarts when a site is recreated).
++
++When there is no outbox, ``delivery_key`` derives a deterministic UUID5 from the
++originating service, its source event ID, the delivery role and the channel. It is the
++same for every retry of the same intended delivery, and different for every other
++delivery.
++
++Algorithm (``KEY_ALGORITHM = "oan-delivery-key/v2"``)::
++
++    material = json.dumps(["oan-delivery-key/v2", service, event_id, role, channel],
++                          separators=(",", ":"), ensure_ascii=True)
++    key      = str(uuid.uuid5(OAN_KEY_NAMESPACE, material))
++
++A JSON array keeps every element's boundaries, so no two different tuples share the same
++material, even when an element contains ``:`` (allowed in inputs). The version tag is
++part of the material, so a future algorithm can never reproduce a v2 key by accident.
++
++Persisted keys: a key is fixed once it has been stored or sent. Never recompute and
++overwrite a stored key with a newer algorithm: OAN would see a different key for the same
++delivery and could send it twice. The earlier MSG-06 draft (``service:event:role:channel``
++joined with ``:``) was never released or deployed, so no stored keys are known; any that
++exist must be reused exactly as stored until their delivery is finished.
++
++Never put OTPs, phone numbers, chat IDs or other personal data into the inputs:
++UUID5 is a hash, and a hash of a short value such as a phone number can be reversed by
++brute force.
++"""
++
++from __future__ import annotations
++
++import json
++import re
++import uuid
++
++#: Fixed namespace for OAN delivery keys (randomly generated once; never change it).
++OAN_KEY_NAMESPACE = uuid.UUID("5b0f6c1e-6f2a-4d4e-9c63-2b7a1f0d8e41")
++#: Version tag included in the hashed material. Changing it changes every key.
++KEY_ALGORITHM = "oan-delivery-key/v2"
++_TOKEN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
++#: An isolated Ethiopian mobile number in any accepted form (+2519…, 2519…, 09…/07…).
++_PHONE_LIKE = re.compile(r"(?<!\d)(?:\+?251|0)[79]\d{8}(?!\d)")
++
++
++def key_material(service: str, event_id: str, role: str, channel: str) -> str:
++    """The exact, unambiguous string that ``delivery_key`` hashes (for audits/tests)."""
++    for part in (service, event_id, role, channel):
++        if not isinstance(part, str) or not _TOKEN.fullmatch(part):
++            raise ValueError("key inputs must be short opaque tokens")
++        if _PHONE_LIKE.search(part):
++            raise ValueError("key inputs must not contain phone numbers")
++    return json.dumps([KEY_ALGORITHM, service, event_id, role, channel],
++                      separators=(",", ":"), ensure_ascii=True)
++
++
++def delivery_key(service: str, event_id: str, role: str, channel: str) -> str:
++    """UUID5 over the JSON array ``[KEY_ALGORITHM, service, event_id, role, channel]``.
++    Refuses inputs that contain an Ethiopian mobile number as a guard against PII in
++    keys."""
++    return str(uuid.uuid5(OAN_KEY_NAMESPACE, key_material(service, event_id, role, channel)))
+diff --git a/backend/src/openg2p_consent_manager/services/otp_consent_service.py b/backend/src/openg2p_consent_manager/services/otp_consent_service.py
+index 5c17ac1..ebb14b5 100644
+--- a/backend/src/openg2p_consent_manager/services/otp_consent_service.py
++++ b/backend/src/openg2p_consent_manager/services/otp_consent_service.py
+@@ -33,7 +33,7 @@ from ..models import (
+ )
+ from .assisted_service import AssistedConsentService
+ from .lifecycle_service import LifecycleError
+-from .otp_service import OtpError, OtpService
++from .otp_service import UNCERTAIN_DELIVERY, OtpError, OtpService
+ from .partner_service import PartnerService
+ from .policy_service import PolicyService
+ from .receipt_service import ReceiptService
+@@ -132,6 +132,9 @@ class OtpConsentService(BaseService):
+             try:
+                 await self.otp.issue(req, req.subject_id_value)
+             except OtpError as exc:
++                if exc.reason == UNCERTAIN_DELIVERY:
++                    # The code may still arrive: keep it valid and keep the send counted.
++                    await session.commit()
+                 raise LifecycleError(exc.status, exc.reason) from exc
+             await session.commit()
+             await session.refresh(req)
+diff --git a/backend/src/openg2p_consent_manager/services/otp_delivery.py b/backend/src/openg2p_consent_manager/services/otp_delivery.py
+new file mode 100644
+index 0000000..b26b246
+--- /dev/null
++++ b/backend/src/openg2p_consent_manager/services/otp_delivery.py
+@@ -0,0 +1,158 @@
++"""Deliver issued OTPs by SMS through the OAN Messaging Service.
++
++Without it, the OTP providers only write the code to the service log (development). With
++``oan_delivery_enabled`` every issued code is sent as one SMS:
++
++* purpose ``otp``; ``expires_at`` is the code's own ``otp_expires_at``, passed
++  unchanged. OAN never sends it after that moment.
++* Idempotency key: ``delivery_key("dpi-consent", <request id>, "otp-consent-<issue>",
++  "sms")``, where ``issue`` is the code's expiry in microseconds. Every re-issue is a new
++  code and a new key; the client's own retries of one code reuse the key, so a farmer
++  never receives the same code twice from OAN.
++* The code is never logged, and neither is the phone.
++
++If the code cannot be handed to OAN (no phone for the subject, rejected, OAN unreachable
++after the client's retries), ``OtpError`` is raised and the API answers with that status.
++A new request is cancelled; a failed resend leaves the previous code in place. When OAN
++may already hold the message (``otp_delivery_unavailable``), the send still counts
++against the resend cooldown and the per-request and per-subject budgets, so retries
++during an OAN slowdown cannot flood the farmer.
++
++Phone resolution: ``oan_phone_resolver = map`` reads ``oan_otp_phone_map`` (dev and
++staging test numbers). Production needs a resolver approved by the identity owner, for
++example a registry lookup of ``demographic_info.phone_number`` by FIN; plug it in at
++``resolve_phone``.
++"""
++
++from __future__ import annotations
++
++import logging
++from datetime import datetime, timezone
++
++from ..config import Settings
++from ..oan_client import (
++    ClientConfig,
++    OanClient,
++    OanClientError,
++    OanRejected,
++    Secret,
++    SmsDelivery,
++    delivery_key,
++)
++from .sms_length import fits_one_sms
++
++_config = Settings.get_config()
++_logger = logging.getLogger(_config.logging_default_logger_name)
++
++TEXT = (
++    "OAN: {code} is your code to allow {partner} to use your registry data. "
++    "It expires in {minutes} minutes. Never share this code."
++)
++#: Used when the full text does not fit one SMS part, for example when the partner name has
++#: Amharic letters (the limit is then 70 characters). No partner name, ASCII only.
++SHORT_TEXT = (
++    "OAN: {code} is your consent code. It expires in {minutes} minutes. Never share this code."
++)
++PARTNER_MAX = 30
++#: Tests may inject an httpx transport (e.g. ``httpx.MockTransport``).
++_transport = None
++
++
++def _otp_error(status: int, reason: str, detail: str):
++    from .otp_provider import OtpError  # late: otp_provider imports this module
++
++    return OtpError(status, reason, detail)
++
++
++def resolve_phone(subject_value: str, individual_id: str | None) -> str | None:
++    if _config.oan_phone_resolver != "map":
++        raise _otp_error(
++            500, "otp_resolver_unsupported", "configured phone resolver is not available"
++        )
++    phones = _config.oan_otp_phones
++    return phones.get(subject_value) or (phones.get(individual_id) if individual_id else None)
++
++
++async def _partner_name(partner_id: str) -> str:
++    try:
++        from .partner_service import PartnerService
++
++        partner = await PartnerService.get_component().get_partner(partner_id)
++        name = (getattr(partner, "name", None) or "").strip()
++    except Exception:  # noqa: BLE001 - a display name never blocks the code
++        name = ""
++    name = name or "a service provider"
++    return name if len(name) <= PARTNER_MAX else name[: PARTNER_MAX - 1].rstrip() + "."
++
++
++def render_otp_text(code: str, partner: str, minutes: int) -> str:
++    """The OTP text, guaranteed to fit one SMS part (OAN refuses anything longer)."""
++    text = TEXT.format(code=code, partner=partner, minutes=minutes)
++    if fits_one_sms(text):
++        return text
++    short = SHORT_TEXT.format(code=code, minutes=minutes)
++    if fits_one_sms(short):
++        return short
++    raise _otp_error(500, "otp_text_too_long", "the OTP text does not fit one SMS part")
++
++
++async def deliver_otp(request, code: str, individual_id: str | None = None) -> str | None:
++    """Send ``code`` for ``request``. Returns the OAN message id, or None when disabled."""
++    if not _config.oan_delivery_enabled:
++        return None
++    if not _config.oan_base_url or not _config.oan_token:
++        raise _otp_error(500, "otp_delivery_misconfigured", "OAN delivery is not configured")
++    transaction = str(request.id)
++    expires_at = request.otp_expires_at
++    if expires_at.tzinfo is None:
++        expires_at = expires_at.replace(tzinfo=timezone.utc)
++    now = datetime.now(timezone.utc)
++    phone = resolve_phone(request.subject_id_value, individual_id)
++    if not phone:
++        raise _otp_error(
++            422, "otp_destination_unknown", "no phone number is registered for this subject"
++        )
++    minutes = max(1, round((expires_at - now).total_seconds() / 60))
++    text = render_otp_text(code, await _partner_name(request.partner_id), minutes)
++    issue = str(int(expires_at.timestamp() * 1_000_000))
++    delivery = SmsDelivery(
++        idempotency_key=delivery_key("dpi-consent", transaction, f"otp-consent-{issue}", "sms"),
++        recipient=phone,
++        text=text,
++        source_reference=f"dpi-consent:{transaction}:otp-consent",
++        purpose="otp",
++        expires_at=expires_at,
++        first_submitted_at=now,
++    )
++    try:
++        cfg = ClientConfig(
++            base_url=_config.oan_base_url,
++            token=Secret(_config.oan_token),
++            connect_timeout=_config.oan_timeout_seconds,
++            read_timeout=_config.oan_timeout_seconds,
++            max_attempts=max(1, _config.oan_max_attempts),
++            ca_bundle=_config.oan_ca_bundle or None,
++        )
++    except ValueError:  # e.g. a non-HTTPS base URL; the message never holds the token
++        raise _otp_error(
++            500, "otp_delivery_misconfigured", "OAN delivery is not configured"
++        ) from None
++    try:
++        client = OanClient(cfg, transport=_transport) if _transport is not None else OanClient(cfg)
++        async with client:
++            submission = await client.submit(delivery)
++    except OanRejected as exc:
++        _logger.error(
++            "OTP delivery rejected by OAN (request %s): HTTP %s %s",
++            request.id,
++            exc.status,
++            exc.code,
++        )
++        raise _otp_error(502, "otp_delivery_rejected", "the SMS service refused the code") from None
++    except (OanClientError, OSError) as exc:
++        _logger.error("OTP delivery unavailable (request %s): %s", request.id, type(exc).__name__)
++        raise _otp_error(
++            503, "otp_delivery_unavailable", "the SMS service is unavailable; ask for a new code"
++        ) from None
++    _logger.info("OTP handed to OAN for consent request %s (message %s)", request.id, submission.id)
++    return submission.id
+diff --git a/backend/src/openg2p_consent_manager/services/otp_provider.py b/backend/src/openg2p_consent_manager/services/otp_provider.py
+index 9f68a5c..9b96677 100644
+--- a/backend/src/openg2p_consent_manager/services/otp_provider.py
++++ b/backend/src/openg2p_consent_manager/services/otp_provider.py
+@@ -11,12 +11,13 @@ Two providers, one interface:
+ ``internal``
+     The generic equivalent: a random code with no Fayda framing.
+ 
+-Neither provider *delivers* anything yet (``delivers = False``): there is no
+-SMS gateway. For testing, the code can be written to the service log
+-(``otp_log_codes``) or to a bucket (``otp_publish_enabled``); with neither,
+-OtpService refuses to issue. A real Fayda / SMS deployment plugs in by
+-implementing ``issue`` and ``verify`` and setting ``delivers = True``; nothing
+-above this file changes.
++Both providers deliver the code by SMS through the OAN Messaging Service when
++``oan_delivery_enabled`` is on and configured (``delivers`` is then true; see
++``otp_delivery``). A code that cannot be handed to OAN raises ``OtpError``, so
++the request is refused instead of waiting on a code nobody received. Without
++OAN, the code can be written to the service log (``otp_log_codes``) or to a
++bucket (``otp_publish_enabled``) for testing; with none of these, OtpService
++refuses to issue.
+ """
+ import hashlib
+ import hmac
+@@ -76,6 +77,25 @@ async def _publish(request, code: str, individual_id: str) -> None:
+         _logger.warning("OTP publish skipped: %s", exc)
+ 
+ 
++async def _deliver(request, code: str, destination: str) -> bool:
++    """Send the code by SMS through OAN when configured. True when handed over;
++    raises OtpError when delivery is configured but fails."""
++    if not _config.oan_delivery_ready:
++        return False
++    from .otp_delivery import deliver_otp  # late: otp_delivery imports OtpError from here
++
++    await deliver_otp(request, code, destination)
++    return True
++
++
++class _DeliversWhenConfigured:
++    """``delivers`` follows the OAN settings, read at use time."""
++
++    @property
++    def delivers(self) -> bool:
++        return _config.oan_delivery_ready
++
++
+ def _announce(request, code: str, destination: str, provider: str) -> None:
+     """Say a code was issued. The code itself only with ``otp_log_codes``
+     (test harness), since anything that reads the log could then use it."""
+@@ -96,12 +116,11 @@ def _count_failure(request) -> OtpError:
+     return OtpError(401, "otp_invalid", "incorrect OTP; %d attempt(s) remaining" % left)
+ 
+ 
+-class FaydaOtpProvider:
++class FaydaOtpProvider(_DeliversWhenConfigured):
+     """Fayda's rules, applied here rather than called over HTTP. The
+     transaction IS the consent-request row, so it is as durable as the request."""
+ 
+     name = "fayda"
+-    delivers = False
+ 
+     async def issue(self, request, destination: str) -> None:
+         transaction_id = request.id
+@@ -115,6 +134,8 @@ class FaydaOtpProvider:
+         # What the code was bound TO; verify() re-derives the hash from it.
+         request.otp_destination = destination
+         request.otp_provider = self.name
++        if await _deliver(request, code, destination):
++            return  # sent by SMS; the test harnesses are not needed
+         await _publish(request, code, destination)
+         _announce(request, code, destination, self.name)
+ 
+@@ -141,11 +162,10 @@ class FaydaOtpProvider:
+         request.otp_verified_at = datetime.now(timezone.utc)
+ 
+ 
+-class InternalOtpProvider:
++class InternalOtpProvider(_DeliversWhenConfigured):
+     """A random code with no Fayda framing. The simplest thing that works."""
+ 
+     name = "internal"
+-    delivers = False
+ 
+     @staticmethod
+     def _hash(code: str, request_id: str) -> str:
+@@ -163,6 +183,8 @@ class InternalOtpProvider:
+         request.otp_channel = "log"
+         request.otp_destination = destination
+         request.otp_provider = self.name
++        if await _deliver(request, code, destination):
++            return  # sent by SMS; the test harnesses are not needed
+         await _publish(request, code, destination)
+         _announce(request, code, destination, self.name)
+ 
+diff --git a/backend/src/openg2p_consent_manager/services/otp_service.py b/backend/src/openg2p_consent_manager/services/otp_service.py
+index 3220059..a76dd33 100644
+--- a/backend/src/openg2p_consent_manager/services/otp_service.py
++++ b/backend/src/openg2p_consent_manager/services/otp_service.py
+@@ -18,6 +18,9 @@ _logger = logging.getLogger(_config.logging_default_logger_name)
+ 
+ __all__ = ["OtpService", "OtpError", "OtpProvider"]
+ 
++#: OtpError reason when the SMS service did not answer clearly: the code may still arrive.
++UNCERTAIN_DELIVERY = "otp_delivery_unavailable"
++
+ 
+ class OtpService(BaseService):
+     def __init__(self, name="", **kwargs):
+@@ -56,7 +59,18 @@ class OtpService(BaseService):
+         if problem:
+             _logger.error("OTP not issued for consent request %s: %s", request.id, problem)
+             raise OtpError(503, "otp_unavailable", problem)
+-        await self._provider.issue(request, destination)
++        try:
++            await self._provider.issue(request, destination)
++        except OtpError as exc:
++            if exc.reason == UNCERTAIN_DELIVERY:
++                # The SMS service may still send this code: count it, so the resend
++                # cooldown and the send budgets hold during an outage.
++                self._count_send(request)
++            raise
++        self._count_send(request)
++
++    @staticmethod
++    def _count_send(request) -> None:
+         request.otp_send_count = (request.otp_send_count or 0) + 1
+         request.otp_last_sent_at = datetime.now(timezone.utc)
+ 
+diff --git a/backend/src/openg2p_consent_manager/services/sms_length.py b/backend/src/openg2p_consent_manager/services/sms_length.py
+new file mode 100644
+index 0000000..ed25827
+--- /dev/null
++++ b/backend/src/openg2p_consent_manager/services/sms_length.py
+@@ -0,0 +1,17 @@
++"""One-SMS-part rule, identical to the OAN Messaging Service's check.
++
++OAN refuses text that does not fit one part, so the OTP text is measured before it is sent.
++"""
++
++GSM7_BASIC = frozenset(
++    "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?"
++    "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà"
++)
++GSM7_EXTENSION = frozenset("^{}\\[~]|€\f")
++
++
++def fits_one_sms(text: str) -> bool:
++    """Same rule OAN enforces: 160 GSM-7 septets (extension chars = 2), else 70 UTF-16."""
++    if all(c in GSM7_BASIC or c in GSM7_EXTENSION for c in text):
++        return sum(2 if c in GSM7_EXTENSION else 1 for c in text) <= 160
++    return len(text.encode("utf-16-le")) // 2 <= 70
+diff --git a/backend/tests/test_oan_otp_delivery.py b/backend/tests/test_oan_otp_delivery.py
+new file mode 100644
+index 0000000..55865f9
+--- /dev/null
++++ b/backend/tests/test_oan_otp_delivery.py
+@@ -0,0 +1,168 @@
++"""OTP delivery through the OAN Messaging Service (services/otp_delivery.py).
++
++The OAN API is an in-process httpx MockTransport shaped like contract 3.0.0. No network,
++no database: the request object is a stand-in with the fields the providers set.
++
++    pip install pytest pytest-asyncio && pytest backend/tests -q
++"""
++
++import json
++import types
++from datetime import datetime, timedelta, timezone
++
++import httpx
++import pytest
++
++from openg2p_consent_manager.services import otp_delivery, otp_provider
++
++PHONE = "0900000601"
++
++
++class FakeOan:
++    def __init__(self, code=202):
++        self.code, self.requests = code, []
++
++    def __call__(self, request):
++        self.requests.append(request)
++        body = json.loads(request.content)
++        if self.code == 202:
++            return httpx.Response(
++                202,
++                json={
++                    "id": "0b9f3a52-5c1e-4d55-9b7a-3f1c2a7e9d10",
++                    "idempotency_key": request.headers["Idempotency-Key"],
++                    "channel": "sms",
++                    "status": "accepted",
++                    "source_reference": body["source_reference"],
++                    "created_at": "2026-09-01T05:12:13Z",
++                    "expires_at": body["expires_at"],
++                },
++            )
++        return httpx.Response(
++            self.code,
++            json={"title": "x", "status": self.code, "errors": [], "code": "service_unavailable"},
++            headers={"content-type": "application/problem+json"},
++        )
++
++
++def request(**kw):
++    base = dict(
++        id="req-1",
++        partner_id="partner-1",
++        subject_id_value="FIN-1001",
++        otp_channel=None,
++        otp_expires_at=datetime.now(timezone.utc) + timedelta(seconds=300),
++    )
++    base.update(kw)
++    return types.SimpleNamespace(**base)
++
++
++@pytest.fixture
++def cfg(monkeypatch):
++    c = otp_delivery._config
++    monkeypatch.setattr(c, "oan_delivery_enabled", True, raising=False)
++    monkeypatch.setattr(c, "oan_base_url", "https://oan-messaging.example.invalid", raising=False)
++    monkeypatch.setattr(c, "oan_token", "oanmsg_" + "t" * 43, raising=False)
++    monkeypatch.setattr(c, "oan_max_attempts", 1, raising=False)
++    monkeypatch.setattr(c, "oan_otp_phone_map", json.dumps({"FIN-1001": PHONE}), raising=False)
++
++    async def name(_pid):
++        return "Awash Bank"
++
++    monkeypatch.setattr(otp_delivery, "_partner_name", name)
++    fake = FakeOan()
++    monkeypatch.setattr(otp_delivery, "_transport", httpx.MockTransport(fake))
++    return fake
++
++
++@pytest.mark.asyncio
++async def test_consent_otp_is_sent_as_otp_with_its_own_deadline(cfg):
++    req = request()
++    mid = await otp_delivery.deliver_otp(req, "482913")
++    assert mid and req.otp_channel is None  # the provider's configured channel is left alone
++    body = json.loads(cfg.requests[0].content)
++    assert body["purpose"] == "otp" and body["recipient"] == PHONE
++    assert "482913" in body["text"] and "Awash Bank" in body["text"]
++    sent = datetime.fromisoformat(body["expires_at"].replace("Z", "+00:00"))
++    assert abs(sent - req.otp_expires_at) < timedelta(seconds=1)
++    assert "482913" not in body["source_reference"]
++
++
++@pytest.mark.asyncio
++async def test_reissue_is_a_new_key(cfg):
++    await otp_delivery.deliver_otp(request(), "111111")
++    await otp_delivery.deliver_otp(
++        request(otp_expires_at=datetime.now(timezone.utc) + timedelta(seconds=301)), "222222"
++    )
++    keys = [r.headers["Idempotency-Key"] for r in cfg.requests]
++    assert len(set(keys)) == 2
++
++
++@pytest.mark.asyncio
++async def test_unknown_subject_phone_fails_visibly(cfg):
++    with pytest.raises(otp_provider.OtpError) as err:
++        await otp_delivery.deliver_otp(request(subject_id_value="FIN-404"), "482913")
++    assert err.value.status == 422 and not cfg.requests
++
++
++@pytest.mark.asyncio
++async def test_oan_unavailable_fails_visibly_without_leaking_the_code(cfg, caplog):
++    cfg.code = 503
++    with pytest.raises(otp_provider.OtpError) as err:
++        await otp_delivery.deliver_otp(request(), "482913")
++    assert err.value.status == 503
++    assert "482913" not in caplog.text
++
++
++@pytest.mark.asyncio
++async def test_disabled_delivery_sends_nothing(cfg, monkeypatch):
++    monkeypatch.setattr(otp_delivery._config, "oan_delivery_enabled", False, raising=False)
++    assert await otp_delivery.deliver_otp(request(), "482913") is None
++    assert not cfg.requests
++
++
++def test_full_text_names_the_partner_when_it_fits():
++    text = otp_delivery.render_otp_text("123456", "Awash Bank", 5)
++    assert "Awash Bank" in text and otp_delivery.fits_one_sms(text)
++
++
++@pytest.mark.parametrize("partner", ["ሙከራ ባንክ", "Awash ባንክ", "Bank “Abay”", "Bank \u2013 Oromia"])
++def test_non_gsm_partner_name_falls_back_to_a_text_that_fits(partner):
++    text = otp_delivery.render_otp_text("123456", partner, 30)
++    assert otp_delivery.fits_one_sms(text)
++    assert partner not in text and "123456" in text
++
++
++def test_longest_ascii_partner_still_fits():
++    partner = "W" * otp_delivery.PARTNER_MAX
++    text = otp_delivery.render_otp_text("12345678", partner, 30)
++    assert partner in text and otp_delivery.fits_one_sms(text)
++
++
++@pytest.mark.asyncio
++async def test_amharic_partner_otp_is_sent_and_fits(cfg, monkeypatch):
++    async def amharic(_pid):
++        return "ሙከራ ባንክ"
++
++    monkeypatch.setattr(otp_delivery, "_partner_name", amharic)
++    assert await otp_delivery.deliver_otp(request(), "123456")
++    body = json.loads(cfg.requests[0].content)
++    assert otp_delivery.fits_one_sms(body["text"]) and "123456" in body["text"]
++
++
++@pytest.mark.asyncio
++async def test_oan_refusal_is_a_visible_502(cfg):
++    cfg.code = 422
++    with pytest.raises(otp_provider.OtpError) as err:
++        await otp_delivery.deliver_otp(request(), "482913")
++    assert (err.value.status, err.value.reason) == (502, "otp_delivery_rejected")
++    assert len(cfg.requests) == 1  # a refusal is never retried
++
++
++@pytest.mark.asyncio
++async def test_non_https_base_url_is_a_configuration_error(cfg, monkeypatch):
++    monkeypatch.setattr(otp_delivery._config, "oan_base_url", "http://oan.example.invalid")
++    with pytest.raises(otp_provider.OtpError) as err:
++        await otp_delivery.deliver_otp(request(), "482913")
++    assert (err.value.status, err.value.reason) == (500, "otp_delivery_misconfigured")
++    assert not cfg.requests
+diff --git a/backend/tests/test_otp_sms.py b/backend/tests/test_otp_sms.py
+new file mode 100644
+index 0000000..1327b07
+--- /dev/null
++++ b/backend/tests/test_otp_sms.py
+@@ -0,0 +1,154 @@
++"""OTP consent codes delivered by SMS through the OAN Messaging Service.
++
++The real partner portal API and database (see conftest); the OAN Messaging API is an
++in-process fake (httpx MockTransport) shaped like contract 3.0.0. Test numbers only.
++"""
++
++import json
++
++import httpx
++import pytest
++from test_assisted_consent import (  # noqa: F401 - fixtures
++    as_partner,
++    bank,
++    portal,
++    realm_key,
++    token,
++    upload,
++)
++from test_otp_consent import (  # noqa: F401 - fixtures
++    OTP,
++    backdate_last_send,
++    codes,
++    otp_body,
++    otp_config,
++    raise_request,
++)
++
++SUBJECT = "123456789012"  # the subject of request_body()
++PHONE = "0900000611"
++
++
++class FakeOan:
++    def __init__(self):
++        self.code, self.requests = 202, []
++
++    def __call__(self, request):
++        self.requests.append(request)
++        body = json.loads(request.content)
++        if self.code == 202:
++            return httpx.Response(
++                202,
++                json={
++                    "id": "0b9f3a52-5c1e-4d55-9b7a-3f1c2a7e9d10",
++                    "idempotency_key": request.headers["Idempotency-Key"],
++                    "channel": "sms",
++                    "status": "accepted",
++                    "source_reference": body["source_reference"],
++                    "created_at": "2026-09-01T05:12:13Z",
++                    "expires_at": body["expires_at"],
++                },
++            )
++        return httpx.Response(
++            self.code,
++            json={"title": "x", "status": self.code, "errors": [], "code": "service_unavailable"},
++            headers={"content-type": "application/problem+json"},
++        )
++
++
++@pytest.fixture
++def oan(monkeypatch, otp_config):  # noqa: F811 - the fixture imported above
++    """OAN delivery on, the log harness off: the SMS is the only way the code travels."""
++    from openg2p_consent_manager.services import otp_delivery
++
++    monkeypatch.setattr(otp_config, "otp_log_codes", False)
++    monkeypatch.setattr(otp_config, "oan_delivery_enabled", True)
++    monkeypatch.setattr(otp_config, "oan_base_url", "https://oan-messaging.example.invalid")
++    monkeypatch.setattr(otp_config, "oan_token", "oanmsg_" + "t" * 43)
++    monkeypatch.setattr(otp_config, "oan_max_attempts", 1)
++    monkeypatch.setattr(otp_config, "oan_otp_phone_map", json.dumps({SUBJECT: PHONE}))
++    fake = FakeOan()
++    monkeypatch.setattr(otp_delivery, "_transport", httpx.MockTransport(fake))
++    return fake
++
++
++def sms_bodies(fake):
++    return [json.loads(r.content) for r in fake.requests]
++
++
++def test_raise_sends_the_code_by_sms(portal, as_partner, bank, codes, oan):  # noqa: F811
++    req = raise_request(as_partner(bank.audience))
++    (body,) = sms_bodies(oan)
++    assert body["recipient"] == PHONE and body["purpose"] == "otp"
++    assert codes[-1] in body["text"]
++    assert body["source_reference"] == f"dpi-consent:{req['id']}:otp-consent"
++
++
++def test_the_sms_code_grants_the_consent(portal, as_partner, bank, codes, oan):  # noqa: F811
++    pc = as_partner(bank.audience)
++    req = raise_request(pc)
++    code = next(w for w in sms_bodies(oan)[0]["text"].split() if w.isdigit() and len(w) == 6)
++    status, consent = pc("POST", f"{OTP}/{req['id']}/verify-otp", json={"otp": code})
++    assert status == 201, consent
++    assert consent["status"] == "active" and consent["consent_request_id"] == req["id"]
++
++
++def test_resend_is_a_new_sms_with_a_new_key(portal, as_partner, bank, codes, oan, run):  # noqa: F811
++    pc = as_partner(bank.audience)
++    req = raise_request(pc)
++    backdate_last_send(run, req["id"])
++    status, body = pc("POST", f"{OTP}/{req['id']}/resend-otp")
++    assert status == 200, body
++    first, second = oan.requests
++    assert first.headers["Idempotency-Key"] != second.headers["Idempotency-Key"]
++    assert codes[-1] in json.loads(second.content)["text"]
++
++
++def test_unreachable_oan_refuses_the_request(portal, as_partner, bank, codes, oan):  # noqa: F811
++    oan.code = 503
++    status, body = as_partner(bank.audience)("POST", OTP, json=otp_body())
++    assert status == 503 and body["error"] == "otp_delivery_unavailable"
++
++
++def test_unknown_subject_phone_is_a_visible_422(
++    portal,  # noqa: F811
++    as_partner,  # noqa: F811
++    bank,  # noqa: F811
++    codes,  # noqa: F811
++    oan,
++    otp_config,  # noqa: F811
++    monkeypatch,
++):
++    monkeypatch.setattr(otp_config, "oan_otp_phone_map", "{}")
++    status, body = as_partner(bank.audience)("POST", OTP, json=otp_body())
++    assert status == 422 and body["error"] == "otp_destination_unknown"
++    assert oan.requests == []
++
++
++def test_delivery_switched_on_without_a_token_issues_nothing(
++    portal,  # noqa: F811
++    as_partner,  # noqa: F811
++    bank,  # noqa: F811
++    codes,  # noqa: F811
++    oan,
++    otp_config,  # noqa: F811
++    monkeypatch,
++):
++    monkeypatch.setattr(otp_config, "oan_token", "")
++    status, body = as_partner(bank.audience)("POST", OTP, json=otp_body())
++    assert status == 503 and body["error"] == "otp_unavailable"
++    assert codes == [] and oan.requests == []
++
++
++def test_an_uncertain_resend_still_counts(portal, as_partner, bank, codes, oan, run):  # noqa: F811
++    """OAN may still send a code it did not confirm, so the cooldown must hold."""
++    pc = as_partner(bank.audience)
++    req = raise_request(pc)
++    backdate_last_send(run, req["id"])
++    oan.code = 503
++    status, body = pc("POST", f"{OTP}/{req['id']}/resend-otp")
++    assert status == 503 and body["error"] == "otp_delivery_unavailable"
++    oan.code = 202
++    status, body = pc("POST", f"{OTP}/{req['id']}/resend-otp")
++    assert status == 429 and body["error"] == "resend_too_soon"
++    assert len(oan.requests) == 2  # the first code and the uncertain resend; nothing more

@@ -1,0 +1,12 @@
+%% eSignet: login OTP delivery (eSignet owns OTP and identity)
+sequenceDiagram
+  autonumber
+  actor F as Farmer
+  participant E as eSignet notification path
+  participant OAN as OAN API
+  F->>E: login with Farmer ID
+  E->>E: generate OTP, expiry, resend rules (unchanged)
+  E->>OAN: POST /messages/sms (otp, expires_at = OTP expiry,<br/>key = delivery_key(esignet, transaction, otp-n, sms))
+  OAN->>F: SMS with OTP
+  F->>E: enter OTP, eSignet verifies (unchanged)
+  Note over E,OAN: a resend is a NEW OTP and a NEW key,<br/>an uncertain POST is retried with the SAME key

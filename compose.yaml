@@ -1,0 +1,32 @@
+# Local development stack (MSG-08): PostgreSQL, migrations and the API. Loopback only.
+# Providers are NOT configured: no worker runs here, so nothing is ever sent. Worker and
+# receipt behaviour is exercised by the test suite with mocked providers.
+#
+#   deploy/local/dev-env.sh          # once: generated development credentials in .env
+#   docker compose up --build
+#   curl http://127.0.0.1:8000/readyz
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run deploy/local/dev-env.sh first}
+      POSTGRES_DB: oan_messaging
+    ports: ["127.0.0.1:5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      retries: 30
+  migrate:
+    build: .
+    env_file: .env
+    command: [alembic, -c, migrations/alembic.ini, upgrade, head]
+    depends_on:
+      postgres: {condition: service_healthy}
+  api:
+    build: .
+    env_file: .env
+    read_only: true
+    tmpfs: [/tmp]
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}

@@ -1,0 +1,40 @@
+# CI for the OAN Messaging repository (MSG-08), run on GitHub Actions for every push and
+# pull request. Mocked providers and a throwaway PostgreSQL service only. Third-party
+# actions are pinned to a commit SHA (tag in the trailing comment); update them together.
+name: ci
+on: [push, pull_request]
+permissions: {contents: read}
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env: {POSTGRES_PASSWORD: ci-only-throwaway}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 30
+    env:
+      OAN_MSG_TEST_DATABASE_URL: postgresql+psycopg://postgres:ci-only-throwaway@127.0.0.1:5432/postgres
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - run: uv sync --frozen --extra dev
+      - run: uv run ruff check . --extend-exclude docs   # docs/ holds standalone analysis scripts
+      - run: uv run mypy -p oan_messaging
+      - run: uv run python -m oan_messaging.contracts
+      - run: PYTHONPATH=.:examples uv run pytest tests -q
+  chart:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - run: pip install pyyaml==6.0.3   # same version as uv.lock
+      - run: deploy/helm/oan-messaging/ci/run-regressions.sh
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: docker build -t oan-messaging:ci .
+      - run: test "$(docker run --rm oan-messaging:ci id -u)" = 10001

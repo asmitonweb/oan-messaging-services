@@ -1,0 +1,14 @@
+%% Auth: password reset by SMS (OTP) - no stored text
+sequenceDiagram
+  autonumber
+  actor U as User
+  participant A as Auth (Frappe)
+  participant J as Post-commit job
+  participant OAN as OAN API
+  U->>A: forgot password (phone)
+  A->>A: issue OTP: pbkdf2 hash, TTL 600 s,<br/>delivery_id = new UUID4
+  A->>J: enqueue after commit (code only in job args)
+  A-->>U: same silent response as today
+  J->>OAN: send_sms_now (otp, expires_at = issued + TTL, at most 30 min,<br/>key = delivery_id, source_reference = auth:password-reset:<id>)
+  OAN->>U: SMS "482913 is your password reset code..."
+  U->>A: code + new password (verification unchanged)

@@ -1,0 +1,19 @@
+{
+  "description": "Grievance acknowledgement in Amharic (UCS-2: at most 70 characters in one SMS).",
+  "request": {
+    "method": "POST",
+    "path": "/api/v1/messages/sms"
+  },
+  "headers": {
+    "Content-Type": "application/json",
+    "Idempotency-Key": "1c9e4f7a-3b2d-4e8f-a6c5-9d0b1e2f3a4b"
+  },
+  "schema": "SmsSubmission",
+  "expect_status": 202,
+  "body": {
+    "recipient": "0900000003",
+    "text": "ቅሬታዎ G-1042 ተቀብለናል። እናመሰግናለን።",
+    "source_reference": "grievance:G-1042:ge-1",
+    "purpose": "transactional"
+  }
+}

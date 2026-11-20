@@ -1,0 +1,98 @@
+# OAN Messaging local integration trial: the msg08 image (API, worker, receipts, cleanup)
+# with least-privilege roles, plus a fake 8028 gateway over mTLS that calls receipts back.
+# Callers (Consent Manager, A2C) join the "oan-trial" network from their own compose files.
+#   ./init-env.sh && docker compose up -d --build
+name: oan-trial
+x-oan: &oan
+  image: oan-messaging:trial
+  env_file: .env
+  networks: [oan-trial]
+  read_only: true
+  tmpfs: [/tmp]
+x-runtime-db: &runtime-db
+  OAN_MSG_DATABASE_URL: postgresql+psycopg://oan_msg_runtime:${OAN_RUNTIME_PW}@oan-db:5432/oan_messaging
+services:
+  oan-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      OAN_OWNER_PW: ${OAN_OWNER_PW}
+      OAN_RUNTIME_PW: ${OAN_RUNTIME_PW}
+    volumes: ["./tools/pg-init.sh:/docker-entrypoint-initdb.d/10-roles.sh:ro"]
+    networks: [oan-trial]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U postgres -d oan_messaging"], interval: 2s, retries: 30}
+  certs:
+    <<: *oan
+    build: ../..
+    user: root
+    read_only: false
+    command: [python, /tools/gen_certs.py, /certs]
+    volumes: [certs:/certs, ./tools:/tools:ro]
+  oan-migrate:
+    <<: *oan
+    environment:
+      OAN_MSG_DATABASE_URL: postgresql+psycopg://oan_msg_owner:${OAN_OWNER_PW}@oan-db:5432/oan_messaging
+    command: [alembic, -c, migrations/alembic.ini, upgrade, head]
+    depends_on: {oan-db: {condition: service_healthy}}
+  oan-grants:
+    image: postgres:16-alpine
+    networks: [oan-trial]
+    environment: {PGPASSWORD: "${OAN_OWNER_PW}"}
+    volumes: ["../../deploy/sql/grants.sql:/grants.sql:ro"]
+    command: [psql, -h, oan-db, -U, oan_msg_owner, -d, oan_messaging, -v, ON_ERROR_STOP=1,
+              -v, runtime_role=oan_msg_runtime, -v, owner_role=oan_msg_owner, -f, /grants.sql]
+    depends_on: {oan-migrate: {condition: service_completed_successfully}}
+  oan-api:
+    <<: *oan
+    environment: *runtime-db
+    # TLS like staging: the OAN client refuses a non-https base URL.
+    command: [uvicorn, --factory, oan_messaging.runtime.api:create_app, --host, 0.0.0.0, --port, "8000",
+              --ssl-certfile, /certs/oan-api-server.crt, --ssl-keyfile, /certs/oan-api-server.key]
+    volumes: [certs:/certs:ro]
+    ports: ["127.0.0.1:18000:8000"]
+    depends_on: {oan-grants: {condition: service_completed_successfully}, certs: {condition: service_completed_successfully}}
+    healthcheck: {test: ["CMD", "python", "-c", "import ssl, urllib.request; urllib.request.urlopen('https://localhost:8000/readyz', context=ssl.create_default_context(cafile='/certs/ca.crt'))"], interval: 3s, retries: 20}
+  oan-worker:
+    <<: *oan
+    environment:
+      <<: *runtime-db
+      OAN_MSG_WORKER_CHANNELS: sms
+      OAN_MSG_SMS8028_CLIENT_SECRET: ${FAKE8028_CLIENT_SECRET}
+      OAN_MSG_SMS8028_CLIENT_CERT: /certs/oan-8028-client.crt
+      OAN_MSG_SMS8028_CLIENT_KEY: /certs/oan-8028-client.key
+      OAN_MSG_SMS8028_CA_CERT: /certs/ca.crt
+      OAN_MSG_SMS8028_BASE_URL: https://fake-8028:8443/sms-api/v1
+    command: [python, -m, oan_messaging.runtime, worker]
+    volumes: [certs:/certs:ro]
+    depends_on: {oan-grants: {condition: service_completed_successfully}, certs: {condition: service_completed_successfully}}
+  oan-receipts:
+    <<: *oan
+    environment:
+      <<: *runtime-db
+      OAN_MSG_RECEIPTS_SERVER_CERT: /certs/receipts-server.crt
+      OAN_MSG_RECEIPTS_SERVER_KEY: /certs/receipts-server.key
+      # As 8028 guide v1.1: trust the CA that issues 8028's callback certificate.
+      OAN_MSG_RECEIPTS_CLIENT_CA_CERTS: /certs/ca.crt
+      OAN_MSG_RECEIPTS_CALLBACK_SECRET: ${FAKE8028_CALLBACK_SECRET}
+      OAN_MSG_RECEIPTS_PORT: "8443"
+    command: [python, -m, oan_messaging.runtime, receipts]
+    volumes: [certs:/certs:ro]
+    depends_on: {oan-grants: {condition: service_completed_successfully}, certs: {condition: service_completed_successfully}}
+  oan-cleanup:
+    <<: *oan
+    environment: *runtime-db
+    command: [python, -m, oan_messaging.runtime, cleanup, --forever]
+    depends_on: {oan-grants: {condition: service_completed_successfully}}
+  fake-8028:
+    <<: *oan
+    environment:
+      FAKE8028_CLIENT_SECRET: ${FAKE8028_CLIENT_SECRET}
+      FAKE8028_CALLBACK_SECRET: ${FAKE8028_CALLBACK_SECRET}
+    command: [python, /tools/fake8028.py]
+    volumes: [certs:/certs:ro, ./tools:/tools:ro]
+    ports: ["127.0.0.1:18028:8080"]
+    depends_on: {certs: {condition: service_completed_successfully}}
+volumes:
+  certs: {}
+networks:
+  oan-trial: {name: oan-trial}

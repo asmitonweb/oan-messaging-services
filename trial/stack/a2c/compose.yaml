@@ -1,0 +1,22 @@
+# A2C (Credit) Frappe site for the integration trial, on the shared oan-trial network.
+name: oan-trial-a2c
+services:
+  a2c-mariadb:
+    image: mariadb:11.8
+    environment: {MARIADB_ROOT_PASSWORD: "${A2C_DB_ROOT_PW}"}
+    command: [--character-set-server=utf8mb4, --collation-server=utf8mb4_unicode_ci, --skip-character-set-client-handshake]
+    networks: [oan-trial]
+    healthcheck: {test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"], interval: 3s, retries: 40}
+  a2c-redis-cache: {image: "redis:7-alpine", networks: [oan-trial]}
+  a2c-redis-queue: {image: "redis:7-alpine", networks: [oan-trial]}
+  a2c-bench:
+    build: .
+    image: oan-trial-a2c-bench:16
+    volumes: [bench:/home/frappe/bench-vol, ../../repos:/repos:ro]
+    networks: [oan-trial]
+    ports: ["127.0.0.1:18100:8000"]
+    depends_on: {a2c-mariadb: {condition: service_healthy}}
+volumes:
+  bench: {}
+networks:
+  oan-trial: {external: true, name: oan-trial}

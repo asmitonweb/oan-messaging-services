@@ -1,0 +1,5 @@
+# Template check: the scheduled alert check (statusCheck) on top of chart defaults.
+# Kept separate from ci/02 so the accepted connection-budget figures there are unchanged;
+# when enabled the check adds statusCheck.pool (1 connection) to both estimates.
+statusCheck:
+  enabled: true

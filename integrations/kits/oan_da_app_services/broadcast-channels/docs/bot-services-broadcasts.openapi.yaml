@@ -1,0 +1,131 @@
+openapi: 3.1.0
+info:
+  title: Bot Services broadcasts (Telegram copy of DA web app broadcasts)
+  version: 0.1.0
+  description: |
+    Channels Specification v2.0 §6.8.2, as the DA backend calls it. Bot Services delivers
+    the Telegram copy; OAN Messaging delivers the SMS copy. Errors, idempotency and status
+    names follow OAN Messaging §3.1–3.4. The kit's stub server implements this file.
+servers:
+  - url: https://bot-services.example.invalid
+security:
+  - clientCredentials: []
+paths:
+  /broadcasts:
+    post:
+      operationId: createBroadcast
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: The DA app's client_op_id. Same key + same body returns the original (200); same key + another body is 409.
+          schema: {type: string, maxLength: 128}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [recipients, scope, sender_ref, sender_role, source, source_reference, title, body]
+              properties:
+                recipients: {type: string, enum: [farmers, das]}
+                scope:
+                  type: object
+                  required: [level, code]
+                  properties:
+                    level: {type: string, enum: [region, zone, woreda, kebele]}
+                    code: {type: string, description: Master Data level_value_id}
+                sender_ref: {type: string, description: "The sender's DA Registry ID, else their DA backend user"}
+                sender_role: {type: string}
+                source: {type: string, enum: [Knowledge, Emergency, Weather, Informational]}
+                source_reference: {type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$'}
+                title: {type: string, maxLength: 140}
+                body: {type: string}
+                expires_at: {type: string, format: date-time, description: 'With offset; at most 7 days ahead; never extended'}
+      responses:
+        '202': {$ref: '#/components/responses/Created'}
+        '200': {$ref: '#/components/responses/Created'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+  /broadcasts/{broadcast_id}:
+    get:
+      operationId: getBroadcast
+      parameters:
+        - {name: broadcast_id, in: path, required: true, schema: {type: string}}
+      responses:
+        '200':
+          description: Progress
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [broadcast_id, state, counts]
+                properties:
+                  broadcast_id: {type: string}
+                  state: {type: string, enum: [running, finished]}
+                  counts:
+                    type: object
+                    properties:
+                      accepted: {type: integer}
+                      sending: {type: integer}
+                      sent: {type: integer}
+                      failed: {type: integer}
+                      expired: {type: integer}
+                      unknown: {type: integer}
+        '404': {$ref: '#/components/responses/Problem'}
+  /broadcasts/{broadcast_id}/telegram-recipients:
+    get:
+      operationId: getTelegramRecipients
+      description: Farmer IDs whose Telegram copy is `sent`. The SMS copy skips exactly these.
+      parameters:
+        - {name: broadcast_id, in: path, required: true, schema: {type: string}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200':
+          description: One page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [farmer_ids, next_cursor]
+                properties:
+                  farmer_ids: {type: array, items: {type: string}}
+                  next_cursor: {type: [string, 'null']}
+        '404': {$ref: '#/components/responses/Problem'}
+components:
+  securitySchemes:
+    clientCredentials:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://keycloak.example.invalid/realms/staff/protocol/openid-connect/token
+          scopes: {}
+  responses:
+    Created:
+      description: 202 new, 200 replay of the same Idempotency-Key and body
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [broadcast_id, recipients, not_on_telegram]
+            properties:
+              broadcast_id: {type: string}
+              recipients: {type: integer, description: Linked recipients the Telegram copy goes to}
+              not_on_telegram:
+                type: array
+                items: {type: string}
+                description: DA Registry IDs of agents of the area not linked to the bot; they get the SMS copy
+    Problem:
+      description: application/problem+json with OAN Messaging's value-free codes
+      content:
+        application/problem+json:
+          schema:
+            type: object
+            required: [status, code]
+            properties:
+              status: {type: integer}
+              code: {type: string, examples: [validation_failed, idempotency_conflict, not_found, unauthenticated, forbidden, service_unavailable]}
+              errors:
+                type: array
+                items: {type: object, properties: {field: {type: string}, code: {type: string}}}

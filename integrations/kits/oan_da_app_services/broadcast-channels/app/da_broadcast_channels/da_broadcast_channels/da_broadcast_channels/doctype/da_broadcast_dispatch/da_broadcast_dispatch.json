@@ -1,0 +1,322 @@
+{
+ "actions": [],
+ "creation": "2026-11-20 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-11-20 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "DA Broadcast Channels",
+ "name": "DA Broadcast Dispatch",
+ "owner": "Administrator",
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": [],
+ "field_order": [
+  "broadcast",
+  "recipients",
+  "scope",
+  "scope_value",
+  "state",
+  "col_a",
+  "send_in_app",
+  "send_sms",
+  "send_telegram",
+  "source",
+  "sms_purpose",
+  "sms_parts",
+  "expires_at",
+  "sec_sender",
+  "sent_by",
+  "sender_role",
+  "client_op_id",
+  "payload_digest",
+  "sec_tg",
+  "telegram_broadcast_id",
+  "telegram_recipients",
+  "telegram_counts",
+  "telegram_finished",
+  "telegram_started_at",
+  "not_on_telegram",
+  "sec_sms",
+  "sms_started_at",
+  "sms_cursor",
+  "sms_targeted",
+  "sms_queued",
+  "sms_skipped_on_telegram",
+  "sms_no_phone",
+  "sms_not_queued",
+  "sec_end",
+  "finished_at",
+  "error"
+ ],
+ "fields": [
+  {
+   "fieldname": "broadcast",
+   "fieldtype": "Link",
+   "label": "Broadcast",
+   "options": "DA Broadcast",
+   "reqd": 1,
+   "unique": 1,
+   "read_only": 1,
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "recipients",
+   "fieldtype": "Select",
+   "label": "Recipients",
+   "options": "farmers\ndas",
+   "reqd": 1,
+   "read_only": 1,
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "scope",
+   "fieldtype": "Select",
+   "label": "Scope",
+   "options": "region\nzone\nworeda\nkebele",
+   "reqd": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "scope_value",
+   "fieldtype": "Data",
+   "label": "Scope Value",
+   "reqd": 1,
+   "read_only": 1,
+   "in_list_view": 1,
+   "description": "Master Data level_value_id"
+  },
+  {
+   "fieldname": "state",
+   "fieldtype": "Select",
+   "label": "State",
+   "options": "Queued\nTelegram sending\nSMS sending\nDone\nFailed",
+   "default": "Queued",
+   "read_only": 1,
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "col_a",
+   "fieldtype": "Column Break",
+   "label": ""
+  },
+  {
+   "fieldname": "send_in_app",
+   "fieldtype": "Check",
+   "label": "In-app",
+   "read_only": 1
+  },
+  {
+   "fieldname": "send_sms",
+   "fieldtype": "Check",
+   "label": "SMS",
+   "read_only": 1
+  },
+  {
+   "fieldname": "send_telegram",
+   "fieldtype": "Check",
+   "label": "Telegram",
+   "read_only": 1
+  },
+  {
+   "fieldname": "source",
+   "fieldtype": "Data",
+   "label": "Source",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sms_purpose",
+   "fieldtype": "Select",
+   "label": "SMS Purpose",
+   "options": "\nalert\nbroadcast",
+   "read_only": 1,
+   "description": "SMS-06: Emergency and Weather are alert; Knowledge and Informational are broadcast"
+  },
+  {
+   "fieldname": "sms_parts",
+   "fieldtype": "Int",
+   "label": "SMS Parts",
+   "read_only": 1
+  },
+  {
+   "fieldname": "expires_at",
+   "fieldtype": "Data",
+   "label": "Expires At",
+   "read_only": 1,
+   "description": "RFC 3339 with offset; never extended"
+  },
+  {
+   "fieldname": "sec_sender",
+   "fieldtype": "Section Break",
+   "label": "Sender"
+  },
+  {
+   "fieldname": "sent_by",
+   "fieldtype": "Link",
+   "label": "Sent By",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sender_role",
+   "fieldtype": "Data",
+   "label": "Sender Role",
+   "read_only": 1
+  },
+  {
+   "fieldname": "client_op_id",
+   "fieldtype": "Data",
+   "label": "Client Op ID",
+   "read_only": 1
+  },
+  {
+   "fieldname": "payload_digest",
+   "fieldtype": "Data",
+   "label": "Payload Digest",
+   "read_only": 1,
+   "hidden": 1
+  },
+  {
+   "fieldname": "sec_tg",
+   "fieldtype": "Section Break",
+   "label": "Telegram"
+  },
+  {
+   "fieldname": "telegram_broadcast_id",
+   "fieldtype": "Data",
+   "label": "Bot Services Broadcast ID",
+   "read_only": 1
+  },
+  {
+   "fieldname": "telegram_recipients",
+   "fieldtype": "Int",
+   "label": "Telegram Recipients",
+   "read_only": 1
+  },
+  {
+   "fieldname": "telegram_counts",
+   "fieldtype": "JSON",
+   "label": "Telegram Counts",
+   "read_only": 1
+  },
+  {
+   "fieldname": "telegram_finished",
+   "fieldtype": "Check",
+   "label": "Telegram Finished",
+   "read_only": 1
+  },
+  {
+   "fieldname": "telegram_started_at",
+   "fieldtype": "Datetime",
+   "label": "Telegram Started At",
+   "read_only": 1
+  },
+  {
+   "fieldname": "not_on_telegram",
+   "fieldtype": "JSON",
+   "label": "Agents Not on Telegram",
+   "read_only": 1,
+   "description": "DA refs returned by Bot Services; they get the SMS copy"
+  },
+  {
+   "fieldname": "sec_sms",
+   "fieldtype": "Section Break",
+   "label": "SMS"
+  },
+  {
+   "fieldname": "sms_started_at",
+   "fieldtype": "Datetime",
+   "label": "SMS Started At",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sms_cursor",
+   "fieldtype": "Small Text",
+   "label": "Beneficiary API Cursor",
+   "read_only": 1,
+   "description": "Where the SMS pass resumes after a restart"
+  },
+  {
+   "fieldname": "sms_targeted",
+   "fieldtype": "Int",
+   "label": "Recipients Read",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sms_queued",
+   "fieldtype": "Int",
+   "label": "SMS Queued",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sms_skipped_on_telegram",
+   "fieldtype": "Int",
+   "label": "Skipped (Reached on Telegram)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sms_no_phone",
+   "fieldtype": "Int",
+   "label": "Skipped (No Phone)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sms_not_queued",
+   "fieldtype": "Int",
+   "label": "Not Queued (Refused by Connector)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sec_end",
+   "fieldtype": "Section Break",
+   "label": ""
+  },
+  {
+   "fieldname": "finished_at",
+   "fieldtype": "Datetime",
+   "label": "Finished At",
+   "read_only": 1
+  },
+  {
+   "fieldname": "error",
+   "fieldtype": "Small Text",
+   "label": "Error",
+   "read_only": 1,
+   "description": "A value-free code; details are in the Error Log"
+  }
+ ],
+ "autoname": "hash",
+ "track_changes": 0,
+ "permissions": [
+  {
+   "role": "System Manager",
+   "read": 1,
+   "write": 0,
+   "create": 0,
+   "delete": 0,
+   "report": 1,
+   "export": 1
+  },
+  {
+   "role": "OAN Administrator",
+   "read": 1,
+   "write": 0,
+   "create": 0,
+   "delete": 0,
+   "report": 1,
+   "export": 1
+  },
+  {
+   "role": "Communications Officer",
+   "read": 1,
+   "write": 0,
+   "create": 0,
+   "delete": 0,
+   "report": 1,
+   "export": 1
+  }
+ ],
+ "description": "SMS and Telegram delivery of one DA Broadcast (da_broadcast_channels)."
+}

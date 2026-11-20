@@ -1,0 +1,33 @@
+%% OAN Messaging: who calls what (pilot). The Telegram bot runs on RapidPro and is not a caller.
+flowchart TB
+  subgraph C1["Frappe apps: notices (install oan_messaging_connector)"]
+    direction LR
+    GR["Grievance"]
+    DA["DA Services"]
+    A2C["Credit (A2C)"]
+  end
+  subgraph C2["OTP senders: send now, never store the code"]
+    direction LR
+    AUTH["Auth<br/>password reset"]
+    ES["eSignet<br/>login"]
+    CM["DPI Consent Manager<br/>consent / data release"]
+  end
+  subgraph C3["Telegram endpoint"]
+    TGP["Future Telegram caller<br/>(none in Phase 1)"]
+  end
+  BEN["Beneficiary API<br/>(registered phone)"]
+  subgraph OAN["OAN Messaging Service (one sender for all)"]
+    direction LR
+    API["API<br/>HTTPS + caller token"] --> DB[("PostgreSQL")]
+    DB --> WK["Worker<br/>rate limit, expiry,<br/>retries"]
+    RC["Receipt ingress<br/>pinned mTLS"] --> DB
+  end
+  C1 -- "outbox + POST + status polls" --> API
+  C2 -- "POST purpose=otp" --> API
+  C3 -. "POST /messages/telegram" .-> API
+  BEN -. "farmer phone" .-> C1
+  WK -- "mTLS" --> G8028["8028 SMS gateway"]
+  WK -- "HTTPS" --> TG["Telegram Bot API"]
+  G8028 -. "delivery receipts" .-> RC
+  G8028 --> PH(["Farmer phone"])
+  TG --> PH

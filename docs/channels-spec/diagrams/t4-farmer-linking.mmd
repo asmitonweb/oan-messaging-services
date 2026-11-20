@@ -1,0 +1,27 @@
+%% Farmer linking: Telegram account <-> registered farmer, OTP to the registered phone
+sequenceDiagram
+  autonumber
+  actor F as Farmer
+  participant RP as RapidPro flow
+  participant LK as OAN Bot Services (linking)
+  participant BEN as Beneficiary API
+  participant AU as Auth service
+  participant OAN as OAN Messaging
+  F->>RP: Main menu > Link my Farmer ID: enters Farmer ID
+  F->>RP: taps "Share my phone number" (contact button)
+  RP->>LK: webhook: farmer id, shared phone, sender id, contact user id
+  LK->>LK: reject unless contact user id = sender (own number)
+  LK->>BEN: registered phone for Farmer ID
+  BEN-->>LK: registered phone (or none)
+  LK->>AU: issue OTP to registered phone (link request id)
+  AU->>OAN: POST /messages/sms purpose otp (Auth's own caller)
+  OAN-->>F: SMS code to the registered phone
+  LK-->>RP: "Code sent to the number ending 12"
+  F->>RP: types the code
+  RP->>LK: webhook: link request id, code
+  LK->>AU: verify OTP
+  AU-->>LK: valid / invalid / expired
+  LK->>LK: store link: contact, Farmer ID, linked phone (registered or Telegram's), verified at
+  LK-->>RP: linked (contact field linked = yes, no ID or phone in RapidPro)
+  RP-->>F: "Your Telegram is linked"
+  Note over F,OAN: shared phone = registered phone: same number. Different: the Telegram phone becomes the alternate,<br/>approved by the OTP to the registered phone. The alternate is never written to the registry or given to SMS senders.

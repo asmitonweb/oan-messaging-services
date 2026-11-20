@@ -1,0 +1,24 @@
+%% DPI Consent Manager: OTP delivery added to the existing OTP providers
+sequenceDiagram
+  autonumber
+  participant Partner as Partner / consent screen
+  participant CM as Consent Manager
+  participant Res as Phone resolver<br/>(owner-approved)
+  participant OAN as OAN API
+  actor F as Farmer
+  Partner->>CM: POST /consent-requests (method otp) or resend-otp
+  CM->>CM: provider.issue(): code, hash, 300 s expiry
+  CM->>Res: phone for subject FIN
+  alt no phone
+    CM-->>Partner: 422 otp_destination_unknown (request refused)
+  else phone found
+    CM->>OAN: POST /messages/sms (otp, expires_at = code expiry)
+    alt OAN refused / unavailable
+      CM-->>Partner: 502 / 503 (request refused, ask again)
+    else accepted
+      CM-->>Partner: 201 / 200 (code never in the response)
+      OAN->>F: SMS "OAN: 123456 is your code to allow <partner>..."
+      F->>Partner: enters code
+      Partner->>CM: POST verify-otp (consent granted)
+    end
+  end

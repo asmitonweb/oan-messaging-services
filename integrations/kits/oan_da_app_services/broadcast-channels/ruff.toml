@@ -1,0 +1,15 @@
+# The kit's stubs and end-to-end script follow the DA (Frappe) house style, like the add-on app
+# in app/da_broadcast_channels (which carries the same settings in its pyproject.toml).
+line-length = 110
+target-version = "py311"
+
+[lint]
+select = ["F", "E", "W", "I", "UP", "B", "RUF"]
+ignore = ["B017", "B904", "E101", "E402", "E501", "E741", "F401", "W191", "UP030", "UP031", "UP032", "UP037"]
+
+[lint.isort]
+known-first-party = ["da_broadcast_channels", "da_services", "oan_messaging_connector", "oan_auth_service"]
+
+[format]
+quote-style = "double"
+indent-style = "tab"

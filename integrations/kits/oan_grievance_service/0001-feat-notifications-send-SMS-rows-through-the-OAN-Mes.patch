@@ -1,0 +1,289 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OAN Messaging <messaging@example.invalid>
+Date: Tue, 17 Nov 2026 08:32:31 +0530
+Subject: [PATCH] feat(notifications): send SMS rows through the OAN Messaging
+ Service
+
+When oan_messaging_connector is configured on the site, _send_sms_row hands the row to
+queue_sms (purpose transactional, source_reference grievance:<grievance>:<event>): the
+connector sends it after commit with a fixed key, retries safely and polls delivery.
+The row becomes "Queued with OAN" and links its OAN Message, instead of reading Sent on
+hand-over; a message OAN cannot queue (too long for one SMS, bad number) fails the row.
+Without OAN, Frappe's own sender and its fail-closed checks are unchanged.
+
+Adds oan_messaging_connector to required_apps, the oan_message field and status
+option, counts handed-over SMS in the ticket form, fetches the connector in CI\n(repository variable OAN_MESSAGING_CONNECTOR_REPO), and five tests.
+---
+ .github/workflows/ci.yml                      |  5 ++
+ .../grievance_notification_log.json           | 15 +++-
+ .../test_grievance_notification_log.py        | 73 +++++++++++++++++++
+ oan_grievance_service/hooks.py                |  2 +-
+ .../services/notifications.py                 | 47 +++++++++++-
+ oan_grievance_service/services/ticket_form.py |  2 +-
+ 6 files changed, 138 insertions(+), 6 deletions(-)
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 39eb1e4..fe5a255 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -92,14 +92,19 @@ jobs:
+         working-directory: /home/runner/frappe-bench
+         run: |
+           bench get-app oan_auth_service https://github.com/Centre-for-Open-Societal-Systems/oan_auth_service.git --branch develop || bench get-app oan_auth_service https://github.com/arnavam/oan_auth_service.git --branch develop
++          # oan_messaging_connector is a required app (farmer SMS); set the repository
++          # variable OAN_MESSAGING_CONNECTOR_REPO until it is published under this org.
++          bench get-app oan_messaging_connector "${OAN_MESSAGING_CONNECTOR_REPO:-https://github.com/Centre-for-Open-Societal-Systems/oan_messaging_connector.git}" --branch develop
+           bench get-app oan_grievance_service $GITHUB_WORKSPACE
+           bench setup requirements --dev
+           bench new-site --db-root-password root --admin-password admin test_site
+           bench --site test_site install-app oan_auth_service
++          bench --site test_site install-app oan_messaging_connector
+           bench --site test_site install-app oan_grievance_service
+           bench build
+         env:
+           CI: 'Yes'
++          OAN_MESSAGING_CONNECTOR_REPO: ${{ vars.OAN_MESSAGING_CONNECTOR_REPO }}
+ 
+       - name: Run Tests
+         working-directory: /home/runner/frappe-bench
+diff --git a/oan_grievance_service/grievance_notification/doctype/grievance_notification_log/grievance_notification_log.json b/oan_grievance_service/grievance_notification/doctype/grievance_notification_log/grievance_notification_log.json
+index 3190ac9..1b21efa 100644
+--- a/oan_grievance_service/grievance_notification/doctype/grievance_notification_log/grievance_notification_log.json
++++ b/oan_grievance_service/grievance_notification/doctype/grievance_notification_log/grievance_notification_log.json
+@@ -24,7 +24,8 @@
+   "notification",
+   "col_transport",
+   "communication",
+-  "sms_log"
++  "sms_log",
++  "oan_message"
+  ],
+  "fields": [
+   {
+@@ -83,7 +84,7 @@
+    "in_list_view": 1,
+    "in_standard_filter": 1,
+    "label": "Status",
+-   "options": "Queued\nSent\nFailed",
++   "options": "Queued\nQueued with OAN\nSent\nFailed",
+    "reqd": 1,
+    "search_index": 1
+   },
+@@ -147,12 +148,20 @@
+    "label": "SMS Log",
+    "options": "SMS Log",
+    "read_only": 1
++  },
++  {
++   "fieldname": "oan_message",
++   "fieldtype": "Link",
++   "label": "OAN Message",
++   "options": "OAN Message",
++   "read_only": 1,
++   "description": "The OAN Messaging outbox row for this SMS: its Desk status and OAN status show whether it was sent and delivered."
+   }
+  ],
+  "grid_page_length": 50,
+  "index_web_pages_for_search": 1,
+  "links": [],
+- "modified": "2026-09-10 17:00:00.000000",
++ "modified": "2026-11-17 09:00:00.000000",
+  "modified_by": "Administrator",
+  "module": "Grievance Notification",
+  "name": "Grievance Notification Log",
+diff --git a/oan_grievance_service/grievance_notification/doctype/grievance_notification_log/test_grievance_notification_log.py b/oan_grievance_service/grievance_notification/doctype/grievance_notification_log/test_grievance_notification_log.py
+index 59c96a7..6d539ba 100644
+--- a/oan_grievance_service/grievance_notification/doctype/grievance_notification_log/test_grievance_notification_log.py
++++ b/oan_grievance_service/grievance_notification/doctype/grievance_notification_log/test_grievance_notification_log.py
+@@ -446,6 +446,10 @@ def setUp(self):
+ 		super().setUp()
+ 		if frappe.get_hooks("send_sms"):
+ 			self.skipTest("a send_sms hook owns delivery here; core's SMS Log is bypassed")
++		# These cover Frappe's own sender, used when OAN Messaging is not configured.
++		oan = mock.patch.object(notifications, "_oan_enabled", return_value=False)
++		oan.start()
++		self.addCleanup(oan.stop)
+ 		self._gateway_was = frappe.db.get_single_value("SMS Settings", "sms_gateway_url")
+ 		self.addCleanup(self._set_gateway, self._gateway_was)
+ 		self._real_send = notifications._send_sms
+@@ -599,3 +603,72 @@ def test_non_grievance_notifications_are_untouched(self):
+ 		).insert(ignore_permissions=True)
+ 		self.addCleanup(frappe.delete_doc, "Notification", doc.name, force=True)
+ 		self.assertTrue(doc.name)
++
++
++class TestSmsThroughOan(NotificationCase):
++	"""With OAN Messaging configured, an SMS row is handed to the connector's outbox.
++
++	The row reads "Queued with OAN" (never "Sent" on hand-over) and links the OAN Message,
++	whose own status shows whether the SMS was sent and delivered. The connector's tests
++	cover sending and polling; nothing leaves this test.
++	"""
++
++	def setUp(self):
++		super().setUp()
++		keys = ("oan_messaging_enabled", "oan_messaging_base_url", "oan_messaging_token")
++		conf = {k: frappe.conf.get(k) for k in keys}
++		self.addCleanup(lambda: [frappe.conf.__setitem__(k, v) for k, v in conf.items()])
++		frappe.conf.oan_messaging_enabled = 1
++		frappe.conf.oan_messaging_base_url = "https://oan-messaging.example.invalid"
++		frappe.conf.oan_messaging_token = "oanmsg_" + "t" * 43
++		enqueue = mock.patch.object(frappe, "enqueue")  # no dispatch job from the test
++		enqueue.start()
++		self.addCleanup(enqueue.stop)
++		self._make_notification(notifications.RECIPIENT_DEPARTMENT_HEAD, channel="SMS")
++
++	def test_sms_row_is_queued_with_oan_and_linked(self):
++		notifications.queue(self.grievance, EVENT)
++		notifications.dispatch_queued(grievance=self.grievance.name)
++
++		row = frappe.get_doc("Grievance Notification Log", self._rows()[0].name)
++		self.assertEqual(row.status, notifications.STATUS_QUEUED_WITH_OAN)
++		message = frappe.get_doc("OAN Message", row.oan_message)
++		self.assertEqual((message.recipient, message.purpose), ("+251900000001", "transactional"))
++		self.assertEqual(message.source_reference, f"grievance:{self.grievance.name}:{EVENT}")
++		self.assertEqual((message.reference_doctype, message.reference_name), (row.doctype, row.name))
++		self.assertEqual(message.event, EVENT)
++		self.assertEqual(message.text, row.message)
++
++	def test_a_message_oan_cannot_queue_fails_the_row(self):
++		notifications.queue(self.grievance, EVENT)
++		frappe.db.set_value(
++			"Grievance Notification Log", self._rows()[0].name, "message", "x" * 200
++		)  # longer than one SMS part
++		notifications.dispatch_queued(grievance=self.grievance.name)
++
++		row = self._rows()[0]
++		self.assertEqual(row.status, "Failed")
++		self.assertFalse(frappe.db.get_value("Grievance Notification Log", row.name, "oan_message"))
++
++	def test_frappes_sender_is_not_used(self):
++		with mock.patch.object(notifications, "_send_sms") as core:
++			notifications.queue(self.grievance, EVENT)
++			notifications.dispatch_queued(grievance=self.grievance.name)
++		core.assert_not_called()
++
++	def test_ticket_form_counts_sms_handed_to_oan(self):
++		from oan_grievance_service.services import ticket_form
++
++		notifications.queue(self.grievance, EVENT)
++		notifications.dispatch_queued(grievance=self.grievance.name)
++		frappe.set_user("Administrator")
++		self.assertIn("SMS", ticket_form._Source(self.grievance).channels)
++
++	def test_a_number_oan_does_not_accept_fails_the_row(self):
++		mobile = frappe.db.get_value("User", self.head, "mobile_no")
++		self.addCleanup(frappe.db.set_value, "User", self.head, "mobile_no", mobile)
++		frappe.db.set_value("User", self.head, "mobile_no", "12345")
++		notifications.queue(self.grievance, EVENT)
++		notifications.dispatch_queued(grievance=self.grievance.name)
++		row = self._rows()[0]
++		self.assertEqual(row.status, "Failed")
+diff --git a/oan_grievance_service/hooks.py b/oan_grievance_service/hooks.py
+index 7713fcf..4215480 100644
+--- a/oan_grievance_service/hooks.py
++++ b/oan_grievance_service/hooks.py
+@@ -8,7 +8,7 @@
+ # Apps
+ # ------------------
+ 
+-required_apps = ["oan_auth_service"]
++required_apps = ["oan_auth_service", "oan_messaging_connector"]
+ 
+ add_to_apps_screen = [
+ 	{
+diff --git a/oan_grievance_service/services/notifications.py b/oan_grievance_service/services/notifications.py
+index 79ee190..2a78467 100644
+--- a/oan_grievance_service/services/notifications.py
++++ b/oan_grievance_service/services/notifications.py
+@@ -79,6 +79,10 @@
+ PARTICIPANTS_BY_ID = {recipient_id: recipient for recipient, recipient_id in PARTICIPANT_IDS.items()}
+ 
+ CHANNEL_SMS = "SMS"
++# An SMS row handed to the OAN Messaging Service: accepted into its outbox, not yet
++# known to be sent. The linked OAN Message shows the delivery outcome.
++STATUS_QUEUED_WITH_OAN = "Queued with OAN"
++_SOURCE_REF_UNSAFE = re.compile(r"[^A-Za-z0-9._:-]")
+ CHANNEL_EMAIL = "Email"
+ # Core's create_system_notification writes per-user Notification Log rows carrying
+ # document_type, document_name, title and description, which a frontend reads over the
+@@ -839,9 +843,47 @@ def _send_email_row(row, grievance):
+ 	return {"communication": communication}
+ 
+ 
++def _oan_enabled() -> bool:
++	"""Whether this site sends SMS through the OAN Messaging Service."""
++	from oan_messaging_connector.send_now import is_configured
++
++	return is_configured()
++
++
++def _queue_with_oan(row, mobile, text):
++	"""Hand one SMS row to the OAN Messaging Service.
++
++	``queue_sms`` adds an outbox row in this transaction (sent after the commit that
++	follows, with a fixed key, retried safely and polled for delivery) and never raises.
++	It returns None when the message cannot be queued (a text longer than one SMS part,
++	or a number that is not an Ethiopian mobile once spaces and dashes are removed); the
++	reason is in the Error Log, and the row fails.
++	"""
++	from oan_messaging_connector.api import queue_sms
++
++	source = _SOURCE_REF_UNSAFE.sub("-", f"grievance:{row.grievance}:{row.event}")[:128]
++	name = queue_sms(
++		recipient=mobile,
++		text=text,
++		purpose="transactional",
++		source_reference=source,
++		reference_doctype="Grievance Notification Log",
++		reference_name=row.name,
++		event=row.event,
++		language=row.language,
++	)
++	if not name:
++		raise ValueError("OAN Messaging did not queue the SMS; see the Error Log for the reason.")
++	return {"status": STATUS_QUEUED_WITH_OAN, "oan_message": name}
++
++
+ def _send_sms_row(row, grievance):
+ 	"""Deliver one queued SMS row.
+ 
++	With the OAN Messaging Service configured on the site, the row is handed to it and
++	becomes "Queued with OAN", linked to its OAN Message (see ``_queue_with_oan``).
++	Otherwise Frappe's own SMS sender is used, as below.
++
+ 	Core writes an SMS Log only on gateway success, and not at all once a send_sms hook
+ 	is registered, so the Grievance Notification Log row is the durable evidence and the
+ 	sms_log link is opportunistic.
+@@ -852,6 +894,9 @@ def _send_sms_row(row, grievance):
+ 	gateway that is missing or not answering shows up as Failed in the log.
+ 	"""
+ 	mobile = _deliverable_mobile(row.recipient, grievance)
++	if _oan_enabled():
++		return _queue_with_oan(row, mobile, strip_html_tags(row.message))
++
+ 	hooked = bool(frappe.get_hooks("send_sms"))
+ 
+ 	if not hooked and not frappe.db.get_single_value("SMS Settings", "sms_gateway_url"):
+@@ -912,7 +957,7 @@ def _next_queued_row(grievance=None):
+ 	"""
+ 	rows = frappe.db.sql(
+ 		"""
+-		select name, grievance, channel, recipient, message, subject
++		select name, grievance, event, channel, recipient, language, message, subject
+ 		from `tabGrievance Notification Log`
+ 		where status = 'Queued' and (%(grievance)s is null or grievance = %(grievance)s)
+ 		order by creation asc, name asc
+diff --git a/oan_grievance_service/services/ticket_form.py b/oan_grievance_service/services/ticket_form.py
+index 5c90e49..dcc3540 100644
+--- a/oan_grievance_service/services/ticket_form.py
++++ b/oan_grievance_service/services/ticket_form.py
+@@ -162,7 +162,7 @@ def __init__(self, doc):
+ 		if self.staff:
+ 			self.channels = _read(
+ 				"Grievance Notification Log",
+-				filters={"grievance": doc.name, "status": "Sent"},
++				filters={"grievance": doc.name, "status": ["in", ["Sent", "Queued with OAN"]]},
+ 				pluck="channel",
+ 				order_by="sent_at asc, name asc",
+ 			)

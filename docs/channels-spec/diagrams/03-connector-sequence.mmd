@@ -1,0 +1,25 @@
+%% Frappe caller with oan_messaging_connector (Grievance, DA, Credit)
+sequenceDiagram
+  autonumber
+  participant App as Caller app code<br/>(e.g. update_loan_status)
+  participant Out as OAN Message<br/>(outbox table)
+  participant Job as Frappe worker<br/>(dispatch_queued)
+  participant OAN as OAN API
+  participant Sch as Frappe scheduler<br/>(poll_statuses)
+  App->>Out: queue_sms(...) inside the business transaction<br/>row = Queued, delivery_id = new UUID4
+  Note over App,Job: business transaction commits.<br/>Rollback = nothing is ever sent. Dispatch is enqueued only after commit.
+  Job->>Out: lock next due row (FOR UPDATE SKIP LOCKED)
+  Job->>OAN: POST /api/v1/messages/sms<br/>Idempotency-Key: delivery_id
+  alt 202 / 200
+    OAN-->>Job: accepted + message id
+    Job->>Out: Submitted, oan_message_id
+  else timeout / 5xx / 429
+    Job->>Out: stays Queued, retry later with the SAME key
+  else 4xx rejection
+    Job->>Out: Failed + Needs Attention
+  end
+  loop backoff until final or receipt window ends
+    Sch->>OAN: GET /api/v1/messages/{id}
+    OAN-->>Sch: sent / delivered / failed / unknown
+    Sch->>Out: oan_status (unknown => Needs Attention)
+  end
