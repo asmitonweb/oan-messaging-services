@@ -1,0 +1,68 @@
+# Test PostgreSQL 16: the owner role (migrations) and the runtime role, as trial/stack/tools/pg-init.sh.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oan-test-postgres-init
+data:
+  10-roles.sh: |-
+    #!/bin/sh
+    set -eu
+    psql -v ON_ERROR_STOP=1 --username postgres <<SQL
+    CREATE ROLE oan_msg_owner LOGIN PASSWORD '${OAN_OWNER_PW}';
+    CREATE ROLE oan_msg_runtime LOGIN PASSWORD '${OAN_RUNTIME_PW}';
+    CREATE DATABASE oan_messaging OWNER oan_msg_owner;
+    SQL
+    psql -v ON_ERROR_STOP=1 --username postgres -d oan_messaging -c "ALTER SCHEMA public OWNER TO oan_msg_owner"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.postgres.serviceName }}
+spec:
+  selector: {app: oan-test-postgres}
+  ports:
+    - {name: postgres, port: 5432, targetPort: 5432}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: oan-test-postgres
+spec:
+  serviceName: {{ .Values.postgres.serviceName }}
+  replicas: 1
+  selector:
+    matchLabels: {app: oan-test-postgres}
+  template:
+    metadata:
+      labels: {app: oan-test-postgres}
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image }}
+          env:
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: oan-test-postgres, key: postgres-password}}
+            - name: OAN_OWNER_PW
+              valueFrom: {secretKeyRef: {name: oan-test-postgres, key: owner-password}}
+            - name: OAN_RUNTIME_PW
+              valueFrom: {secretKeyRef: {name: oan-test-postgres, key: runtime-password}}
+          ports:
+            - {name: postgres, containerPort: 5432}
+          readinessProbe:
+            exec: {command: [pg_isready, -U, postgres, -d, oan_messaging]}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d, readOnly: true}
+      volumes:
+        - {name: init, configMap: {name: oan-test-postgres-init, defaultMode: 0555}}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: {{ .Values.postgres.storageClass }}
+        resources: {requests: {storage: {{ .Values.postgres.size }}}}

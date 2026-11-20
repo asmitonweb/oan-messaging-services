@@ -1,0 +1,49 @@
+# OAN Messaging on registry-test (namespace oan-messaging), with the fake 8028 from test-deps.
+#   helm upgrade --install oan deploy/helm/oan-messaging -n oan-messaging \
+#     -f deploy/helm/oan-messaging/values-pilot.yaml -f deploy/environments/registry-test/values-oan-messaging.yaml
+# The Secrets named by the chart defaults are created by test-deps (install that release first).
+fullnameOverride: oan            # Services oan-api and oan-receipts (the test certificates name oan-receipts)
+
+image:
+  repository: ghcr.io/asmitonweb/oan-messaging
+  tag: main
+  pullPolicy: Always
+
+database:
+  migration:
+    existingSecret: oan-messaging-database     # migration-url: the owner role
+
+secrets:
+  sms8028:
+    caKey: ca.crt                              # the fake 8028's test CA (the real 8028 uses a public CA)
+  receipts:
+    clientCaSecret: oan-messaging-8028-callback-ca
+    clientCaKeys: [ca.crt]
+    pinnedCertsSecret: ""
+    pinnedCertKeys: []
+
+config:
+  sms8028BaseUrl: https://fake-8028:8443/sms-api/v1
+
+api:
+  replicas: 1
+  pdb: {enabled: false}
+worker:
+  replicas: 1
+receipts:
+  replicas: 1
+  pdb: {enabled: false}
+  service:
+    type: ClusterIP
+    port: 443
+
+networkPolicy:
+  enabled: true
+  api:
+    from:
+      # registry-test's Istio ingress gateway (public HTTPS ends in the host nginx) and in-cluster callers.
+      - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: istio-system}}
+      - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: oan-messaging}}
+      - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: consent-sms}}
+  receipts:
+    fromCIDRs: [10.42.0.0/16]                  # the fake 8028 pod (RKE2 pod network)

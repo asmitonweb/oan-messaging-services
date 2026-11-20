@@ -1,0 +1,34 @@
+# The service image: the init and fake-8028 scripts run on its Python (cryptography included).
+image:
+  repository: ghcr.io/asmitonweb/oan-messaging
+  tag: main
+  pullPolicy: Always
+
+postgres:
+  image: postgres:16-alpine
+  storageClass: nfs-csi
+  size: 2Gi
+  # Service name; also the host in the generated database URLs.
+  serviceName: oan-test-postgres
+
+fake8028:
+  enabled: true
+  # The chart's receipt Service is oan-receipts (fullnameOverride: oan) on port 443; the test
+  # certificates name it oan-receipts.
+  callbackUrl: https://oan-receipts/sms-status-receiver/v1/update-status
+  mode: ok          # ok | http503 | http401 (failure drills)
+  callbackDelaySeconds: "1.0"
+
+# Public HTTPS for the API: registry-test's nginx ends TLS (*.test.oanstaging.com, public CA)
+# and forwards to the Istio gateway istio-system/test. The Consent Manager's client needs HTTPS.
+route:
+  enabled: true
+  host: oan-messaging.test.oanstaging.com
+  gateway: istio-system/test
+  service: oan-api
+  port: 80
+
+grants:
+  # The last table grants.sql lists; the Job waits for it (migrations ran) before granting.
+  waitForTable: stats_state
+  timeoutSeconds: 1800

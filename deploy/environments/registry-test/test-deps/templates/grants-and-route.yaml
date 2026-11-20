@@ -1,0 +1,62 @@
+# deploy/sql/grants.sql (copy in files/), applied as the owner once the migrations created the tables.
+# Named by the release revision, so every upgrade of this chart applies the grants again (needed after
+# a migration that adds a table).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oan-test-grants
+data:
+  grants.sql: |-
+{{ .Files.Get "files/grants.sql" | indent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oan-test-grants-{{ .Release.Revision }}
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  activeDeadlineSeconds: {{ add .Values.grants.timeoutSeconds 120 }}
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: grants
+          image: {{ .Values.postgres.image }}
+          env:
+            - {name: PGHOST, value: {{ .Values.postgres.serviceName | quote }}}
+            - {name: PGUSER, value: oan_msg_owner}
+            - {name: PGDATABASE, value: oan_messaging}
+            - name: PGPASSWORD
+              valueFrom: {secretKeyRef: {name: oan-test-postgres, key: owner-password}}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              end=$(( $(date +%s) + {{ .Values.grants.timeoutSeconds }} ))
+              until psql -tAc "select to_regclass('public.{{ .Values.grants.waitForTable }}') is not null" 2>/dev/null | grep -q t; do
+                [ "$(date +%s)" -lt "$end" ] || { echo "migrations did not create {{ .Values.grants.waitForTable }} in time"; exit 1; }
+                echo "waiting for the migrations"; sleep 10
+              done
+              psql -v ON_ERROR_STOP=1 -v runtime_role=oan_msg_runtime -v owner_role=oan_msg_owner -f /sql/grants.sql
+              echo "grants applied"
+          volumeMounts:
+            - {name: sql, mountPath: /sql, readOnly: true}
+      volumes:
+        - {name: sql, configMap: {name: oan-test-grants}}
+{{- if .Values.route.enabled }}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: oan-messaging-api
+spec:
+  hosts: [{{ .Values.route.host | quote }}]
+  gateways: [{{ .Values.route.gateway | quote }}]
+  http:
+    - route:
+        - destination:
+            host: {{ printf "%s.%s.svc.cluster.local" .Values.route.service .Release.Namespace }}
+            port: {number: {{ .Values.route.port }}}
+{{- end }}

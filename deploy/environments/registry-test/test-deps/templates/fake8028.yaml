@@ -1,0 +1,71 @@
+{{- if .Values.fake8028.enabled }}
+# Fake 8028 gateway (trial/stack/tools/fake8028.py): mTLS send endpoint on 8443, callbacks to the
+# receipt ingress, and a test "handset" inbox on 8080 (cluster-internal only).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oan-test-fake8028
+data:
+  fake8028.py: |-
+{{ .Files.Get "files/fake8028.py" | indent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fake-8028
+spec:
+  selector: {app: oan-test-fake8028}
+  ports:
+    - {name: gateway, port: 8443, targetPort: 8443}
+    - {name: inbox, port: 8080, targetPort: 8080}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oan-test-fake8028
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: oan-test-fake8028}
+  template:
+    metadata:
+      labels: {app: oan-test-fake8028}
+    spec:
+      securityContext: {runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, fsGroup: 10001}
+      containers:
+        - name: fake8028
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [python, /tools/fake8028.py]
+          env:
+            - {name: CERTS_DIR, value: /certs}
+            - {name: FAKE8028_CALLBACK_URL, value: {{ .Values.fake8028.callbackUrl | quote }}}
+            - {name: FAKE8028_MODE, value: {{ .Values.fake8028.mode | quote }}}
+            - {name: FAKE8028_CALLBACK_DELAY, value: {{ .Values.fake8028.callbackDelaySeconds | quote }}}
+            - name: FAKE8028_CLIENT_SECRET
+              valueFrom: {secretKeyRef: {name: oan-test-fake8028, key: client-secret}}
+            - name: FAKE8028_CALLBACK_SECRET
+              valueFrom: {secretKeyRef: {name: oan-test-fake8028, key: callback-secret}}
+          ports:
+            - {name: gateway, containerPort: 8443}
+            - {name: inbox, containerPort: 8080}
+          readinessProbe: {tcpSocket: {port: gateway}, periodSeconds: 10}
+          resources:
+            requests: {cpu: 20m, memory: 64Mi}
+            limits: {cpu: 250m, memory: 192Mi}
+          volumeMounts:
+            - {name: tools, mountPath: /tools, readOnly: true}
+            - {name: certs, mountPath: /certs, readOnly: true}
+      volumes:
+        - {name: tools, configMap: {name: oan-test-fake8028}}
+        - name: certs
+          secret:
+            secretName: oan-test-fake8028
+            defaultMode: 0440
+            items:
+              - {key: ca.crt, path: ca.crt}
+              - {key: fake8028-server.crt, path: fake8028-server.crt}
+              - {key: fake8028-server.key, path: fake8028-server.key}
+              - {key: callback-client.crt, path: callback-client.crt}
+              - {key: callback-client.key, path: callback-client.key}
+{{- end }}

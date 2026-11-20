@@ -1,0 +1,82 @@
+# Generates the test Secrets once (files/init_secrets.py); later upgrades find them and do nothing.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: oan-test-init
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-20"
+    helm.sh/hook-delete-policy: before-hook-creation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: oan-test-init
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-20"
+    helm.sh/hook-delete-policy: before-hook-creation
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: oan-test-init
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-20"
+    helm.sh/hook-delete-policy: before-hook-creation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: oan-test-init
+subjects:
+  - kind: ServiceAccount
+    name: oan-test-init
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oan-test-init-scripts
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-20"
+    helm.sh/hook-delete-policy: before-hook-creation
+data:
+  init_secrets.py: |-
+{{ .Files.Get "files/init_secrets.py" | indent 4 }}
+  gen_certs.py: |-
+{{ .Files.Get "files/gen_certs.py" | indent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oan-test-init
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 300
+  template:
+    spec:
+      serviceAccountName: oan-test-init
+      restartPolicy: Never
+      securityContext: {runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true}
+      containers:
+        - name: init
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [python, /scripts/init_secrets.py]
+          env:
+            - {name: DB_HOST, value: {{ .Values.postgres.serviceName | quote }}}
+          volumeMounts:
+            - {name: scripts, mountPath: /scripts, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: scripts, configMap: {name: oan-test-init-scripts}}
+        - {name: tmp, emptyDir: {}}

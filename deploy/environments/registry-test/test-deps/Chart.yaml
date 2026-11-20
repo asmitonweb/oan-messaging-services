@@ -1,0 +1,9 @@
+apiVersion: v2
+name: oan-messaging-test-deps
+description: >-
+  Test-only dependencies for an OAN Messaging install on registry-test: generated Secrets (once), PostgreSQL 16 with
+  the owner and runtime roles, the grants after each migration, the fake 8028 gateway and the API route.
+  Never for staging or production (real PostgreSQL, real 8028 credentials and Secrets from the secret store).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
