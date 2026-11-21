@@ -1,0 +1,13 @@
+image: ghcr.io/asmitonweb/commons/consent-manager-api:oan-sms
+postgres:
+  image: postgres:16-alpine
+  storageClass: nfs-csi
+  size: 2Gi
+# The partner realm is replaced by a test key: tokens are signed in the driver pod, the public JWKS is served here.
+partnerIssuer: https://cm-test.invalid/realms/partner
+oan:
+  baseUrl: https://oan-messaging.test.oanstaging.com
+  # Secret in this namespace with key "token" (copied from oan-messaging/oan-caller-dpi-consent; never in values).
+  tokenSecret: oan-caller-dpi-consent
+  # Test subjects only: FAYDA_FAN value -> fake 8028 test number. A subject missing here is the CM-05 case.
+  phoneMap: '{"100000000001": "0900000701", "100000000002": "0900000702", "100000000003": "0900000703"}'

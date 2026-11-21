@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cm-test-init
+  annotations: {"helm.sh/hook": pre-install, "helm.sh/hook-weight": "-10"}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cm-test-init
+  annotations: {"helm.sh/hook": pre-install, "helm.sh/hook-weight": "-10"}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cm-test-init
+  annotations: {"helm.sh/hook": pre-install, "helm.sh/hook-weight": "-10"}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: cm-test-init}
+subjects:
+  - {kind: ServiceAccount, name: cm-test-init}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cm-test-init
+  annotations: {"helm.sh/hook": pre-install, "helm.sh/hook-weight": "-10"}
+data:
+  init_secrets.py: |-
+{{ .Files.Get "files/init_secrets.py" | indent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cm-test-init
+  annotations: {"helm.sh/hook": pre-install, "helm.sh/hook-weight": "-5", "helm.sh/hook-delete-policy": before-hook-creation}
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      serviceAccountName: cm-test-init
+      restartPolicy: Never
+      containers:
+        - name: init
+          image: {{ .Values.image }}
+          command: [python3, /scripts/init_secrets.py]
+          volumeMounts: [{name: scripts, mountPath: /scripts}]
+      volumes:
+        - {name: scripts, configMap: {name: cm-test-init}}

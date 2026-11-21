@@ -1,0 +1,6 @@
+apiVersion: v2
+name: cm-test
+description: Consent Manager (fork branch oan-sms) on registry-test for the OTP-by-SMS acceptance cases CM-01 to CM-08. Test only.
+type: application
+version: 0.1.0
+appVersion: oan-sms

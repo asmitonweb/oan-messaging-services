@@ -1,0 +1,101 @@
+# Test partner realm: only the public JWKS (the private key stays in the driver pod).
+apiVersion: v1
+kind: Service
+metadata: {name: cm-test-jwks}
+spec:
+  selector: {app: cm-test-jwks}
+  ports: [{name: http, port: 8080, targetPort: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: cm-test-jwks}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: cm-test-jwks}}
+  template:
+    metadata: {labels: {app: cm-test-jwks}}
+    spec:
+      containers:
+        - name: jwks
+          image: {{ .Values.image }}
+          command: [python3, -m, http.server, "8080", -d, /jwks]
+          ports: [{containerPort: 8080}]
+          resources: {requests: {cpu: 10m, memory: 32Mi}, limits: {memory: 128Mi}}
+          volumeMounts: [{name: jwks, mountPath: /jwks, readOnly: true}]
+      volumes:
+        - name: jwks
+          secret: {secretName: cm-test-partner-key, items: [{key: jwks.json, path: jwks.json}]}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: cm-api}
+spec:
+  selector: {app: cm-api}
+  ports: [{name: http, port: 80, targetPort: 8000}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: cm-api}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: cm-api}}
+  template:
+    metadata: {labels: {app: cm-api}}
+    spec:
+      containers:
+        - name: api
+          image: {{ .Values.image }}
+          imagePullPolicy: Always
+          ports: [{containerPort: 8000}]
+          env:
+            - {name: CONSENT_MANAGER_APP_HOST, value: 0.0.0.0}
+            - {name: CONSENT_MANAGER_APP_PORT, value: "8000"}
+            - {name: CONSENT_MANAGER_NO_OF_WORKERS, value: "1"}
+            - {name: CONSENT_MANAGER_DB_HOSTNAME, value: cm-test-postgres}
+            - {name: CONSENT_MANAGER_DB_PORT, value: "5432"}
+            - {name: CONSENT_MANAGER_DB_DBNAME, value: consent}
+            - {name: CONSENT_MANAGER_DB_USERNAME, value: consent}
+            - name: CONSENT_MANAGER_DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: cm-test-app, key: db-password}}
+            # Staff endpoints (partner bindings) are open in this test install; partner calls need a test realm token.
+            - {name: CONSENT_MANAGER_AUTH_ENABLED, value: "false"}
+            - {name: CONSENT_MANAGER_PARTNER_AUTH_ISSUER, value: {{ .Values.partnerIssuer | quote }}}
+            - {name: CONSENT_MANAGER_PARTNER_AUTH_JWKS_URL, value: http://cm-test-jwks:8080/jwks.json}
+            - {name: CONSENT_MANAGER_OTP_PROVIDER, value: internal}
+            - name: CONSENT_MANAGER_OTP_SALT
+              valueFrom: {secretKeyRef: {name: cm-test-app, key: otp-salt}}
+            - {name: CONSENT_MANAGER_OTP_LOG_CODES, value: "false"}
+            - {name: CONSENT_MANAGER_OTP_PUBLISH_ENABLED, value: "false"}
+            - {name: CONSENT_MANAGER_OAN_DELIVERY_ENABLED, value: "true"}
+            - {name: CONSENT_MANAGER_OAN_BASE_URL, value: {{ .Values.oan.baseUrl | quote }}}
+            - name: CONSENT_MANAGER_OAN_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ .Values.oan.tokenSecret }}, key: token, optional: true}}
+            - {name: CONSENT_MANAGER_OAN_OTP_PHONE_MAP, value: {{ .Values.oan.phoneMap | quote }}}
+          readinessProbe:
+            tcpSocket: {port: 8000}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+---
+# Acceptance driver: same image (httpx, PyJWT); holds the test partner-realm private key.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: cm-test-driver}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: cm-test-driver}}
+  template:
+    metadata: {labels: {app: cm-test-driver}}
+    spec:
+      containers:
+        - name: driver
+          image: {{ .Values.image }}
+          command: [sleep, infinity]
+          env:
+            - {name: PARTNER_ISSUER, value: {{ .Values.partnerIssuer | quote }}}
+          resources: {requests: {cpu: 10m, memory: 64Mi}, limits: {memory: 256Mi}}
+          volumeMounts: [{name: key, mountPath: /partner, readOnly: true}]
+      volumes:
+        - name: key
+          secret: {secretName: cm-test-partner-key, items: [{key: private.pem, path: private.pem}]}

@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: Service
+metadata: {name: cm-test-postgres}
+spec:
+  selector: {app: cm-test-postgres}
+  ports: [{name: postgres, port: 5432, targetPort: 5432}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: cm-test-postgres}
+spec:
+  serviceName: cm-test-postgres
+  replicas: 1
+  selector: {matchLabels: {app: cm-test-postgres}}
+  template:
+    metadata: {labels: {app: cm-test-postgres}}
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image }}
+          env:
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+            - {name: POSTGRES_USER, value: consent}
+            - {name: POSTGRES_DB, value: consent}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: cm-test-app, key: db-password}}
+          ports: [{name: postgres, containerPort: 5432}]
+          readinessProbe:
+            exec: {command: [pg_isready, -U, consent, -d, consent]}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: {{ .Values.postgres.storageClass }}
+        resources: {requests: {storage: {{ .Values.postgres.size }}}}
