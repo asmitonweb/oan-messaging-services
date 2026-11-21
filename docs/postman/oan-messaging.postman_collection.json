@@ -1,0 +1,1096 @@
+{
+  "info": {
+    "name": "OAN Messaging Service (contract 3.2.0)",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "SMS (8028) and Telegram delivery for OAN services. Contract: docs/openapi.yaml (3.2.0).\n\nSetup: import an environment from docs/postman, paste the caller token into `callerToken` (and a statistics-reader token into `statsToken` for Charts). Tokens are issued by the OAN operator (`python -m oan_messaging.runtime issue-credential`); keep them as secret values, never commit or share them.\n\nEvery POST needs an `Idempotency-Key` (8 to 128 of A-Z a-z 0-9 . _ : -). The collection makes a new one per request; a real caller uses one stable key per intended message and reuses it on every retry. 202 = new, 200 = identical replay (same id), 409 = same key with a different body.\n\nRules: one recipient per message (Ethiopian mobile: 09/07 series, 2519..., +2519...). An `otp` must carry `expires_at` and fit one SMS part (160 GSM-7 or 70 characters if any Amharic/Unicode). Other texts may use up to 3 parts (459 GSM-7 / 201 Unicode). 202 means accepted, not sent: poll the status.\n\nOn the registry-test environment the gateway is a fake 8028: nothing reaches a real phone."
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// A fresh Idempotency-Key, source_reference and expires_at per request. Requests with the",
+          "// X-Keep-Key header reuse the previous request's values (replay and conflict checks).",
+          "if (!pm.request.headers.has('X-Keep-Key')) {",
+          "  pm.collectionVariables.set('idempotencyKey', 'pm-' + pm.variables.replaceIn('{{$guid}}'));",
+          "  pm.collectionVariables.set('sourceReference', 'postman:' + Date.now());",
+          "  // expires_at: 5 minutes ahead for OTPs, 30 minutes for everything else.",
+          "  const ttl = (pm.request.name || '').toLowerCase().includes('otp') ? 5 : 30;",
+          "  pm.collectionVariables.set('expiresAt', new Date(Date.now() + ttl * 60000).toISOString().replace(/\\.\\d{3}Z$/, 'Z'));",
+          "}"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "idempotencyKey",
+      "value": ""
+    },
+    {
+      "key": "sourceReference",
+      "value": ""
+    },
+    {
+      "key": "expiresAt",
+      "value": ""
+    },
+    {
+      "key": "messageId",
+      "value": ""
+    },
+    {
+      "key": "lastKey",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Health",
+      "item": [
+        {
+          "name": "Liveness",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Process is up. No token.",
+            "url": {
+              "raw": "{{baseUrl}}/livez",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "livez"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Readiness",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Database reachable and the service ready for traffic. No token.",
+            "url": {
+              "raw": "{{baseUrl}}/readyz",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "readyz"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Send SMS",
+      "item": [
+        {
+          "name": "Send OTP",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 202', () => pm.response.to.have.status(202));",
+                  "if (pm.response.code === 202 || pm.response.code === 200) {",
+                  "  const b = pm.response.json();",
+                  "  pm.collectionVariables.set('messageId', b.id);",
+                  "  pm.collectionVariables.set('lastKey', b.idempotency_key);",
+                  "  pm.test('response never carries the text', () => pm.expect(b).to.not.have.property('text'));",
+                  "  pm.test('status is accepted', () => pm.expect(b.status).to.eql('accepted'));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{callerToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "description": "An OTP: `expires_at` required (the code's own expiry), one SMS part, highest priority. OAN never sends it after `expires_at`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient\": \"{{recipient}}\",\n  \"text\": \"Your OAN code is 123456. It expires in 5 minutes. Do not share it.\",\n  \"purpose\": \"otp\",\n  \"source_reference\": \"{{sourceReference}}\",\n  \"expires_at\": \"{{expiresAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/sms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "sms"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Message status",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 200', () => pm.response.to.have.status(200));",
+                  "const s = pm.response.json();",
+                  "pm.test('recipient is masked', () => pm.expect(s.recipient_masked).to.include('*'));",
+                  "pm.test('no text in the status', () => pm.expect(s).to.not.have.property('text'));",
+                  "console.log('status', s.status, 'final', s.final, 'provider', s.provider_status || '-');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{callerToken}}"
+              }
+            ],
+            "description": "Status of a message this caller submitted. Never contains the text; the recipient is masked. Statuses: accepted, sending, sent, delivered (final), expired, failed, unknown (final). Never resubmit an `unknown` message under a new key: 8028 may have sent it.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/{{messageId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "{{messageId}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Send transactional",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 202', () => pm.response.to.have.status(202));",
+                  "if (pm.response.code === 202 || pm.response.code === 200) {",
+                  "  const b = pm.response.json();",
+                  "  pm.collectionVariables.set('messageId', b.id);",
+                  "  pm.collectionVariables.set('lastKey', b.idempotency_key);",
+                  "  pm.test('response never carries the text', () => pm.expect(b).to.not.have.property('text'));",
+                  "  pm.test('status is accepted', () => pm.expect(b.status).to.eql('accepted'));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{callerToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "description": "A notice in response to a user action. Up to 3 SMS parts. `expires_at` optional but recommended.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient\": \"{{recipient}}\",\n  \"text\": \"Your grievance GRV-1024 has been resolved. Thank you for contacting OAN.\",\n  \"purpose\": \"transactional\",\n  \"source_reference\": \"{{sourceReference}}\",\n  \"expires_at\": \"{{expiresAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/sms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "sms"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Send transactional (Amharic)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 202', () => pm.response.to.have.status(202));",
+                  "if (pm.response.code === 202 || pm.response.code === 200) {",
+                  "  const b = pm.response.json();",
+                  "  pm.collectionVariables.set('messageId', b.id);",
+                  "  pm.collectionVariables.set('lastKey', b.idempotency_key);",
+                  "  pm.test('response never carries the text', () => pm.expect(b).to.not.have.property('text'));",
+                  "  pm.test('status is accepted', () => pm.expect(b.status).to.eql('accepted'));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{callerToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "description": "Any Amharic character makes the whole text Unicode: 70 characters per part, 201 for 3 parts.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient\": \"{{recipient}}\",\n  \"text\": \"የቅሬታዎ ቁጥር GRV-1024 ተፈትቷል። እናመሰግናለን።\",\n  \"purpose\": \"transactional\",\n  \"source_reference\": \"{{sourceReference}}\",\n  \"expires_at\": \"{{expiresAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/sms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "sms"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Replay with the same key",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{callerToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              },
+              {
+                "key": "X-Keep-Key",
+                "value": "1",
+                "description": "Reuse the previous request's key"
+              }
+            ],
+            "description": "Run 'Send transactional' first, then this: it reuses that key with the same body. Expect 200 with the same message id and no second SMS. (Bodies must be byte-identical, including `source_reference` and `expires_at`, so run it straight after, before the variables change.)",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient\": \"{{recipient}}\",\n  \"text\": \"Your grievance GRV-1024 has been resolved. Thank you for contacting OAN.\",\n  \"purpose\": \"transactional\",\n  \"source_reference\": \"{{sourceReference}}\",\n  \"expires_at\": \"{{expiresAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/sms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "sms"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Refusals (expected errors)",
+      "item": [
+        {
+          "name": "No token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 401', () => pm.response.to.have.status(401));",
+                  "pm.test('problem code is unauthenticated', () => pm.expect(pm.response.json().code).to.eql('unauthenticated'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "description": "401 `unauthenticated`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient\": \"{{recipient}}\",\n  \"text\": \"Hello\",\n  \"purpose\": \"transactional\",\n  \"source_reference\": \"{{sourceReference}}\",\n  \"expires_at\": \"{{expiresAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/sms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "sms"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Missing Idempotency-Key",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 422', () => pm.response.to.have.status(422));",
+                  "pm.test('problem code is validation_failed', () => pm.expect(pm.response.json().code).to.eql('validation_failed'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{callerToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "422 `validation_failed`, field `header.Idempotency-Key` code `required`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient\": \"{{recipient}}\",\n  \"text\": \"Hello\",\n  \"purpose\": \"transactional\",\n  \"source_reference\": \"{{sourceReference}}\",\n  \"expires_at\": \"{{expiresAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/sms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "sms"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Wrong content type",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 415', () => pm.response.to.have.status(415));",
+                  "pm.test('problem code is unsupported_media_type', () => pm.expect(pm.response.json().code).to.eql('unsupported_media_type'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{callerToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "description": "415: the body must be `application/json`.",
+            "body": {
+              "mode": "raw",
+              "raw": "recipient=0900000000",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/sms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "sms"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Invalid phone number",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 422', () => pm.response.to.have.status(422));",
+                  "pm.test('problem code is validation_failed', () => pm.expect(pm.response.json().code).to.eql('validation_failed'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{callerToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "description": "422: only Ethiopian mobile numbers (09/07 series).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient\": \"0123456789\",\n  \"text\": \"Hello\",\n  \"purpose\": \"transactional\",\n  \"source_reference\": \"{{sourceReference}}\",\n  \"expires_at\": \"{{expiresAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/sms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "sms"
+              ]
+            }
+          }
+        },
+        {
+          "name": "OTP without expires_at",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 422', () => pm.response.to.have.status(422));",
+                  "pm.test('problem code is validation_failed', () => pm.expect(pm.response.json().code).to.eql('validation_failed'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{callerToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "description": "422: an OTP must carry its expiry.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient\": \"{{recipient}}\",\n  \"text\": \"Your code is 123456.\",\n  \"purpose\": \"otp\",\n  \"source_reference\": \"{{sourceReference}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/sms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "sms"
+              ]
+            }
+          }
+        },
+        {
+          "name": "OTP longer than one part",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 422', () => pm.response.to.have.status(422));",
+                  "pm.test('problem code is validation_failed', () => pm.expect(pm.response.json().code).to.eql('validation_failed'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{callerToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "description": "422: an OTP must fit one SMS part (here 71 Unicode characters; 70 is the limit).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient\": \"{{recipient}}\",\n  \"text\": \"ሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀ\",\n  \"purpose\": \"otp\",\n  \"source_reference\": \"{{sourceReference}}\",\n  \"expires_at\": \"{{expiresAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/sms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "sms"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Text longer than three parts",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 422', () => pm.response.to.have.status(422));",
+                  "pm.test('problem code is validation_failed', () => pm.expect(pm.response.json().code).to.eql('validation_failed'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{callerToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "description": "422: more than 201 Unicode characters is refused, never cut.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient\": \"{{recipient}}\",\n  \"text\": \"ሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀሀ\",\n  \"purpose\": \"transactional\",\n  \"source_reference\": \"{{sourceReference}}\",\n  \"expires_at\": \"{{expiresAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/sms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "sms"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Purpose not granted",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 403', () => pm.response.to.have.status(403));",
+                  "pm.test('problem code is forbidden', () => pm.expect(pm.response.json().code).to.eql('forbidden'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{callerToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "description": "403 `forbidden` (`purpose_not_permitted`) unless this caller was created with that purpose. Broadcast is also off until the deployment enables it.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient\": \"{{recipient}}\",\n  \"text\": \"Weather advisory for your kebele.\",\n  \"purpose\": \"broadcast\",\n  \"source_reference\": \"{{sourceReference}}\",\n  \"expires_at\": \"{{expiresAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/sms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "sms"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Same key, different body",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 409', () => pm.response.to.have.status(409));",
+                  "pm.test('problem code is idempotency_conflict', () => pm.expect(pm.response.json().code).to.eql('idempotency_conflict'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{callerToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              },
+              {
+                "key": "X-Keep-Key",
+                "value": "1",
+                "description": "Reuse the previous request's key"
+              }
+            ],
+            "description": "Run after any successful send: reuses its key with another body. 409 `idempotency_conflict`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient\": \"{{recipient}}\",\n  \"text\": \"A different text under a used key.\",\n  \"purpose\": \"transactional\",\n  \"source_reference\": \"{{sourceReference}}\",\n  \"expires_at\": \"{{expiresAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/sms",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "sms"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Status of an unknown id",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 404', () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{callerToken}}"
+              }
+            ],
+            "description": "404: unknown id, or a message of another caller.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/00000000-0000-4000-8000-000000000000",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "00000000-0000-4000-8000-000000000000"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Telegram",
+      "item": [
+        {
+          "name": "Send Telegram",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 202', () => pm.response.to.have.status(202));",
+                  "if (pm.response.code === 202 || pm.response.code === 200) {",
+                  "  const b = pm.response.json();",
+                  "  pm.collectionVariables.set('messageId', b.id);",
+                  "  pm.collectionVariables.set('lastKey', b.idempotency_key);",
+                  "  pm.test('response never carries the text', () => pm.expect(b).to.not.have.property('text'));",
+                  "  pm.test('status is accepted', () => pm.expect(b.status).to.eql('accepted'));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{callerToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "description": "Only for callers configured with a Telegram bot (else 403 `telegram_bot_not_configured`). `chat_id` is an integer: the farmer must have started the bot. No delivery receipts on Telegram.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chat_id\": {{chatId}},\n  \"text\": \"Your visit is confirmed for tomorrow.\",\n  \"purpose\": \"transactional\",\n  \"source_reference\": \"{{sourceReference}}\",\n  \"expires_at\": \"{{expiresAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/telegram",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "telegram"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Charts (statistics reader)",
+      "item": [
+        {
+          "name": "KPIs",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{statsToken}}"
+              }
+            ],
+            "description": "Counts only. Needs a token of a caller created with `--stats-reader` (else 403 `stats_not_permitted`). Query: from/to (YYYY-MM-DD), granularity (day|week|month), caller, purpose, channel (comma lists).",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/charts/msgKpis?",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "charts",
+                "msgKpis"
+              ],
+              "query": [
+                {
+                  "key": "from",
+                  "value": "2026-11-01",
+                  "disabled": true
+                },
+                {
+                  "key": "to",
+                  "value": "2026-11-30",
+                  "disabled": true
+                },
+                {
+                  "key": "granularity",
+                  "value": "day",
+                  "disabled": true
+                },
+                {
+                  "key": "purpose",
+                  "value": "otp,transactional",
+                  "disabled": true
+                },
+                {
+                  "key": "channel",
+                  "value": "sms",
+                  "disabled": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Several charts",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{statsToken}}"
+              }
+            ],
+            "description": "Up to 20 chart ids in `charts`: msgKpis, msgTrend, msgByCaller, msgByPurpose, msgFailureReasons, msgOtpLatency, msgCampaigns, msgQueueNow, msgProviderHealth, msgFilterCallers.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/charts?charts=msgKpis,msgTrend,msgByPurpose,msgOtpLatency,msgQueueNow&granularity=day",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "charts"
+              ],
+              "query": [
+                {
+                  "key": "charts",
+                  "value": "msgKpis,msgTrend,msgByPurpose,msgOtpLatency,msgQueueNow"
+                },
+                {
+                  "key": "granularity",
+                  "value": "day"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
